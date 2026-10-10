@@ -29,6 +29,8 @@ As Pi tools (installed via `pi install <this-dir>`), Pi navigates step by
 step on one persistent session:
 
 | Tool | What Pi does with it |
+|---|---| 
+_Postscript: data tools (`browser_search`, `browser_open`, `browser_video_transcript_) return dual-channel results — readable text for the model plus typed `structuredContent` (declared `outputSchema`) for codemode scripts. No JSON parsing by the model._
 |---|---|
 | `browser_search` | search the web → structured title+url results |
 | `browser_open` | open a URL in the session, read it as markdown |
@@ -51,6 +53,8 @@ step on one persistent session:
 | `browser_close` | close the session (reopens on next navigate) |
 | `browser_reset` | close session + wipe profile copy (poisoned state, endless walls) |
 | `/chrome-config` | show resolved config (nothing secret exists to leak) |
+
+_Data tools (`browser_search`, `browser_open`, `browser_video_transcript`) return dual-channel results: readable text for the model plus typed `structuredContent` (declared `outputSchema`) for codemode scripts. No JSON parsing by the model._
 
 ```bash
 npx tsx examples/run.ts --query "population of Zurich" --engine google

@@ -131,9 +131,33 @@ export function isJunkResult(url: string, homeHost: string, siteSearch = false):
   return chrome.has(u.pathname.replace(/\/$/, "") || "/");
 }
 
-/** Fixed, code-owned extraction script (model output never reaches evaluate).
- *  No viewport filter: below-fold results count. Captures a snippet from the
- *  nearest texty ancestor so results carry descriptions, not just titles. */
+/** Fixed, code-owned metadata script: meta tags, OpenGraph, JSON-LD. */
+const META_JS = `(() => {
+  const meta = (sel, attr) => {
+    const el = document.querySelector(sel);
+    return el ? (el.getAttribute(attr || 'content') || '').trim() : '';
+  };
+  let author = meta('meta[name="author"]') || meta('meta[property="article:author"]');
+  let published = meta('meta[property="article:published_time"]') || meta('meta[name="date"]') || meta('meta[name="publish-date"]') || meta('time[datetime]', 'datetime');
+  let description = meta('meta[name="description"]') || meta('meta[property="og:description"]');
+  try {
+    for (const s of document.querySelectorAll('script[type="application/ld+json"]')) {
+      const blobs = JSON.parse(s.textContent);
+      for (const b of Array.isArray(blobs) ? blobs : [blobs]) {
+        const g = b['@graph'] || [b];
+        for (const n of (Array.isArray(g) ? g : [g])) {
+          if (!n || typeof n !== 'object') continue;
+          const au = n.author;
+          if (!author && au) author = typeof au === 'string' ? au : (au.name || (Array.isArray(au) && au[0] && au[0].name) || '');
+          if (!published && n.datePublished) published = n.datePublished;
+          if (!description && n.description) description = String(n.description).slice(0, 300);
+          if (author && published && description) break;
+        }
+      }
+    }
+  } catch (e) {}
+  return { author, published, description };
+})()`;
 const RESULTS_JS = `(() => {
   const out = [];
   const seen = new Set();
@@ -166,6 +190,10 @@ export interface OpenedPage {
   /** Readable content: markdown by default, else plain visible text. */
   text: string;
   format: "text" | "markdown";
+  /** Article metadata (author/date/description) when the page publishes it. */
+  author?: string;
+  published?: string;
+  description?: string;
 }
 
 /**
@@ -203,11 +231,18 @@ export async function open(
           page = await b.observe();
         }
       }
+      const withMeta = <T extends Record<string, unknown>>(base: T, meta: Record<string, string>): T & Partial<Record<string, string>> => {
+        const out: Record<string, unknown> = { ...base };
+        for (const [k, v] of Object.entries(meta)) if (v) out[k] = v;
+        return out as T & Partial<Record<string, string>>;
+      };
       if (format === "text") {
-        return { url: page.url, title: page.title, text: page.text || "", format };
+        const meta0 = await b.evaluate<{ author: string; published: string; description: string }>(META_JS);
+        return withMeta({ url: page.url, title: page.title, text: page.text || "", format }, meta0);
       }
       const raw = await b.evaluate<string>(MARKDOWN_JS);
-      return { url: page.url, title: page.title, text: cleanMarkdown(raw, opts.maxChars ?? 8000), format };
+      const meta = await b.evaluate<{ author: string; published: string; description: string }>(META_JS);
+      return withMeta({ url: page.url, title: page.title, text: cleanMarkdown(raw, opts.maxChars ?? 8000), format }, meta);
     },
     opts,
   );
@@ -274,6 +309,34 @@ async function respectRateLimit(): Promise<void> {
   const wait = 4000 - (Date.now() - lastSearchAt);
   if (wait > 0) await sleep(wait);
   lastSearchAt = Date.now();
+}
+
+/**
+ * Fan-out: run several queries sequentially (one browser per profile dir
+ * forbids true parallelism) and merge URL-deduped in order. Failures
+ * surface per query — never another engine's results in disguise.
+ */
+export async function searchMany(
+  queries: string[],
+  opts: { engine?: SearchEngine; maxResults?: number; headless?: boolean; profileDir?: string; depth?: number } = {},
+): Promise<{ results: SearchResult[]; errors: { query: string; error: string }[] }> {
+  const results: SearchResult[] = [];
+  const errors: { query: string; error: string }[] = [];
+  const seen = new Set<string>();
+  const maxResults = opts.maxResults ?? 10;
+  for (const query of queries) {
+    try {
+      const batch = await search(query, opts);
+      for (const r of batch) {
+        if (results.length >= maxResults || seen.has(r.url)) continue;
+        seen.add(r.url);
+        results.push(r);
+      }
+    } catch (err) {
+      errors.push({ query, error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+  return { results, errors };
 }
 
 export async function search(

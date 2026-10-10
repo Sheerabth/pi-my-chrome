@@ -25,6 +25,7 @@
  */
 
 import { Type } from "typebox";
+import type { JsonValue } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   act,
@@ -45,6 +46,7 @@ import {
   savePdf,
   screenshot,
   search,
+  searchMany,
   searchPage,
   tabClose,
   tabList,
@@ -75,8 +77,20 @@ export function myChromeOverrides(settings: unknown): Partial<ChromeConfig> {
   return out;
 }
 
-function textResult(text: string, details: unknown) {
-  return { content: [{ type: "text" as const, text }], details };
+function textResult(text: string, details: unknown, structured?: unknown) {
+  let structuredContent: JsonValue | undefined;
+  if (structured !== undefined) {
+    try {
+      structuredContent = JSON.parse(JSON.stringify(structured)) as JsonValue;
+    } catch {
+      structuredContent = undefined;
+    }
+  }
+  return {
+    content: [{ type: "text" as const, text }],
+    details,
+    ...(structuredContent !== undefined ? { structuredContent } : {}),
+  };
 }
 
 function failed(tool: string, err: unknown, details: unknown) {
@@ -108,14 +122,17 @@ export default function (pi: ExtensionAPI) {
     name: "browser_search",
     label: "Search the web",
     description:
-      "Search the web (Google, Bing, DuckDuckGo, Brave) through the user's stealth browser and get " +
-      "structured title+url results. No keys, fast. Follow with browser_open to read a result.",
+      "Search the web through the user's stealth browser and get " +
+      "structured title+url+snippet results. No keys, fast. Follow with browser_open to read a result. " +
+      "If a search comes back empty, retry the exact query ONCE; if still empty, stop for a while " +
+      "(hammering triggers walls) — never silently switch engines.",
     promptGuidelines: [
       "Prefer browser_search for public-web questions; it needs no login.",
       "Use the navigate/act tools instead when the task needs logins, forms, or judging pages mid-task.",
     ],
     parameters: Type.Object({
-      query: Type.String({ description: "Search query." }),
+      query: Type.String({ description: "Search query (ignored when queries is set)." }),
+      queries: Type.Optional(Type.Array(Type.String(), { description: "Fan-out: several queries, merged URL-deduped. Errors surface per query." })),
       engine: Type.Optional(Type.Union(
         [Type.Literal("google"), Type.Literal("bing"),
          Type.Literal("youtube"), Type.Literal("reddit"), Type.Literal("github")],
@@ -124,17 +141,44 @@ export default function (pi: ExtensionAPI) {
       maxResults: Type.Optional(Type.Number({ description: "How many results. Default 5, max 50 (large counts are slow)." })),
       depth: Type.Optional(Type.Number({ description: "Inline full content for the top N results. Default 0 (titles only)." })),
     }),
+    outputSchema: Type.Object({
+      query: Type.Optional(Type.String()),
+      queries: Type.Optional(Type.Array(Type.String())),
+      results: Type.Array(Type.Object({
+        title: Type.String(),
+        url: Type.String(),
+        engine: Type.String(),
+        snippet: Type.Optional(Type.String()),
+        content: Type.Optional(Type.String()),
+      })),
+      errors: Type.Optional(Type.Array(Type.Object({ query: Type.String(), error: Type.String() }))),
+    }),
     execute: async (_toolCallId, params) => {
       ensureEnv();
       try {
         const cfg = loadConfig(settingsOverrides());
-        const results = await search(params.query, {
+        const base = {
           engine: (params.engine ?? "google") as "google",
           maxResults: Math.min(params.maxResults ?? 5, 50),
           depth: Math.min(params.depth ?? 0, 5),
           headless: cfg.headless,
           profileDir: cfg.profileDir,
-        });
+        };
+        if (params.queries && params.queries.length > 0) {
+          const { results, errors } = await searchMany(params.queries.slice(0, 10), base);
+          const lines = results.map((r, i) =>
+            `${i + 1}. ${r.title}\n   ${r.url}` +
+            (r.snippet ? `\n   ${r.snippet.slice(0, 200)}` : "") +
+            (r.content ? `\n   --- content ---\n${r.content.slice(0, 1500)}` : ""),
+          );
+          for (const e of errors) lines.push(`(query failed: ${e.query} — ${e.error.slice(0, 120)})`);
+          return textResult(
+            lines.length > 0 ? lines.join("\n") : "No results found.",
+            { queries: params.queries, results, errors },
+            { queries: params.queries, results, errors },
+          );
+        }
+        const results = await search(params.query, base);
         const lines = results.map((r, i) =>
           `${i + 1}. ${r.title}\n   ${r.url}` +
           (r.snippet ? `\n   ${r.snippet.slice(0, 200)}` : "") +
@@ -142,6 +186,7 @@ export default function (pi: ExtensionAPI) {
         );
         return textResult(
           lines.length > 0 ? lines.join("\n") : "No results found.",
+          { query: params.query, results },
           { query: params.query, results },
         );
       } catch (err) {
@@ -163,11 +208,24 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       url: Type.String({ description: "URL to open and read." }),
     }),
+    outputSchema: Type.Object({
+      url: Type.String(),
+      title: Type.String(),
+      text: Type.String(),
+      author: Type.Optional(Type.String()),
+      published: Type.Optional(Type.String()),
+      description: Type.Optional(Type.String()),
+    }),
     execute: async (_toolCallId, params) => {
       ensureEnv();
       try {
         const page = await navigate(params.url, sessionOpts());
-        return textResult(`Title: ${page.title}\nURL: ${page.url}\n\n${page.text.slice(0, 4000)}`, page);
+        const structured: Record<string, unknown> = { url: page.url, title: page.title, text: page.text };
+        for (const k of ["author", "published", "description"] as const) {
+          const v = (page as Record<string, unknown>)[k];
+          if (typeof v === "string" && v) structured[k] = v;
+        }
+        return textResult(`Title: ${page.title}\nURL: ${page.url}\n\n${page.text.slice(0, 4000)}`, page, structured);
       } catch (err) {
         return failed("browser_open", err, { url: params.url });
       }
@@ -540,6 +598,13 @@ export default function (pi: ExtensionAPI) {
       url: Type.String({ description: "YouTube watch/share/shorts URL." }),
       lang: Type.Optional(Type.String({ description: "Caption language code. Default en." })),
     }),
+    outputSchema: Type.Object({
+      videoId: Type.String(),
+      title: Type.String(),
+      lang: Type.String(),
+      autoGenerated: Type.Boolean(),
+      segments: Type.Array(Type.Object({ start: Type.Number(), dur: Type.Number(), text: Type.String() })),
+    }),
     execute: async (_toolCallId, params) => {
       try {
         const t = await videoTranscript(params.url, params.lang ?? "en");
@@ -550,6 +615,7 @@ export default function (pi: ExtensionAPI) {
           `${t.title || "Untitled"} (${t.lang}${t.autoGenerated ? ", auto-generated" : ""}, ${t.segments.length} lines)\n\n` +
             (body.length > 6000 ? body.slice(0, 6000) + "\n[…truncated]" : body),
           { videoId: t.videoId, segments: t.segments },
+          { videoId: t.videoId, title: t.title, lang: t.lang, autoGenerated: t.autoGenerated, segments: t.segments },
         );
       } catch (err) {
         return failed("browser_video_transcript", err, { url: params.url });
