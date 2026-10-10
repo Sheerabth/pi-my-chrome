@@ -1,9 +1,8 @@
-__pycache__/
-.venv/
+node_modules/
 dist/
-*.egg-info/
 .env
 /tmp/agent-chrome/
 record/
 *.jpg
 .DS_Store
+.idea/

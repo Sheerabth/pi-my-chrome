@@ -1,0 +1,46 @@
+{
+  "name": "pi-my-chrome",
+  "version": "0.1.0",
+  "description": "Pi extension: Pi browses websites through your Chrome profile. Search, open, navigate, act.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "bin": {
+    "pi-my-chrome": "./dist/examples/run.js"
+  },
+  "scripts": {
+    "build": "tsc && cp -r vendor dist/vendor",
+    "typecheck": "tsc --noEmit",
+    "run": "tsx examples/run.ts",
+    "run:simple": "tsx examples/run_simple.ts"
+  },
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "browser",
+    "automation"
+  ],
+  "pi": {
+    "extensions": [
+      "./pi-extension/my-chrome.ts"
+    ]
+  },
+  "dependencies": {
+    "cloakbrowser": "^0.6.0",
+    "playwright-core": "^1.63.0"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.1.0",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.0.0",
+    "typebox": "1.3.27",
+    "typescript": "^5.6.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}
