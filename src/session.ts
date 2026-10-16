@@ -12,6 +12,7 @@
  * agents coexist — per-process ops still serialize here for safety.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { AgentBrowserAdapter } from "./browserAdapter.js";
 import type { LaunchOpts } from "./browserAdapter.js";
 import { daemonStatus, shutdownDaemon } from "./daemon.js";
@@ -28,6 +29,33 @@ export interface SessionOpts extends Omit<LaunchOpts, "userDataDir"> {
 
 let session: AgentBrowserAdapter | null = null;
 let inFlight: Promise<void> = Promise.resolve();
+
+/** Thrown when the harness cancels the call (Escape). Never retried: the
+ *  wedged op may still land in the background, so retrying could double-act. */
+export class AbortError extends Error {
+  override name = "AbortError";
+}
+
+/** AbortSignal of the in-flight tool call, set per call by the extension.
+ *  Escape rejects the call at once, drops the wedged session, and releases
+ *  the mutex — the next call starts fresh instead of queueing behind a corpse. */
+const callSignal = new AsyncLocalStorage<AbortSignal | undefined>();
+
+/** Run fn with the harness AbortSignal attached (extension entry only). */
+export function runWithSignal<T>(signal: AbortSignal | undefined, fn: () => Promise<T>): Promise<T> {
+  return callSignal.run(signal, fn);
+}
+
+/** Rejects when signal aborts (already-aborted rejects at once). */
+function abortRace(signal: AbortSignal): Promise<never> {
+  return new Promise<never>((_, reject) => {
+    if (signal.aborted) {
+      reject(new AbortError("Browser operation aborted."));
+      return;
+    }
+    signal.addEventListener("abort", () => reject(new AbortError("Browser operation aborted.")), { once: true });
+  });
+}
 
 /** In-memory session defaults (set via configureSession, e.g. from Pi
  *  settings + /browser-config). Merged under per-call opts in
@@ -67,12 +95,14 @@ async function exclusive<T>(fn: () => Promise<T>): Promise<T> {
     await prev;
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      return await Promise.race([
-        fn(),
+      const pending: Promise<never>[] = [
         new Promise<never>((_, reject) => {
           timer = setTimeout(() => reject(new Error("Browser operation timed out after 150s")), OP_DEADLINE_MS);
         }),
-      ]);
+      ];
+      const sig = callSignal.getStore();
+      if (sig) pending.push(abortRace(sig));
+      return await Promise.race([fn(), ...pending]);
     } finally {
       if (timer) clearTimeout(timer);
       release();
@@ -81,6 +111,21 @@ async function exclusive<T>(fn: () => Promise<T>): Promise<T> {
   try {
     return await runOnce();
   } catch (err) {
+    // User cancelled (Escape): drop the session WITHOUT awaiting its close
+    // (the point is to return at once) and never retry — the wedged op may
+    // still land in the background, so a retry could double-act.
+    if (err instanceof AbortError) {
+      try {
+        void session?.close().catch(() => undefined);
+      } catch {
+        // Best-effort.
+      }
+      session = null;
+      activeRoot = null;
+      activeProxy = undefined;
+      activeHeadless = undefined;
+      throw err;
+    }
     // Timeout: unknown browser state, and the wedged op might still land
     // later — so drop the session but do NOT retry (no double-acts).
     if (err instanceof Error && err.message.includes("timed out after")) {
@@ -139,8 +184,8 @@ async function ensureSession(url?: string, opts: SessionOpts = {}): Promise<Agen
     });
     activeRoot = root;
     activeProxy = m.proxy ?? undefined;
-    // Normalized: daemon default is headed (false), so undefined === false.
-    activeHeadless = m.headless ?? false;
+    // Normalized: daemon default is headless (true), so undefined === true.
+    activeHeadless = m.headless ?? true;
   } else if (url) {
     // navigate() on a session whose main tab is still an untouched
     // about:blank reuses that tab (adapter.goto navigates the operated
@@ -313,10 +358,13 @@ export async function searchPage(
   return exclusive(async () => (await ensureSession()).searchPageText(pattern, opts));
 }
 
-/** Fixed wait (capped at 30s, like upstream), then re-observe. */
+/** Fixed wait (capped at 30s, like upstream), then re-observe. The wait
+ *  itself honours call abort; the re-observe goes through the mutex. */
 export async function wait(seconds: number): Promise<PageSnapshot> {
   const ms = Math.min(Math.max(seconds, 0), 30) * 1000;
-  await new Promise((r) => setTimeout(r, ms));
+  const sig = callSignal.getStore();
+  if (sig) await Promise.race([new Promise((r) => setTimeout(r, ms)), abortRace(sig)]);
+  else await new Promise((r) => setTimeout(r, ms));
   return exclusive(async () => (await ensureSession()).observe());
 }
 

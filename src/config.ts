@@ -15,11 +15,12 @@ export interface ChromeConfig {
   proxy?: string;
 }
 
-/** Resolve the full typed config. */
+/** Resolve the full typed config. Headless by default (agents don't watch);
+ *  headed only when asked (manual login via /browser-open, or headless:false). */
 export function loadConfig(overrides: Partial<ChromeConfig> = {}): ChromeConfig {
   return {
     profileDir: overrides.profileDir,
-    headless: overrides.headless ?? false,
+    headless: overrides.headless ?? true,
     locale: overrides.locale,
     timezone: overrides.timezone,
     proxy: overrides.proxy,
@@ -30,7 +31,7 @@ export function loadConfig(overrides: Partial<ChromeConfig> = {}): ChromeConfig 
 export function redacted(config: ChromeConfig): Record<string, unknown> {
   return {
     profileDir: config.profileDir ?? "/tmp/agent-chrome",
-    headless: config.headless ?? false,
+    headless: config.headless ?? true,
     locale: config.locale ?? "default",
     timezone: config.timezone ?? "default",
     proxy: config.proxy ? "set" : "unset",

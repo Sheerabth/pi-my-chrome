@@ -27,10 +27,18 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { Type } from "typebox";
+import type { Static, TSchema } from "typebox";
 import type { JsonValue } from "@earendil-works/pi-ai";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+  AgentToolResult,
+  AgentToolUpdateCallback,
+  ExtensionAPI,
+  ExtensionToolContext,
+  ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
 import {
   act,
+  AbortError,
   back,
   clickAt,
   closeSession,
@@ -49,6 +57,7 @@ import {
   read,
   redacted,
   resetSession,
+  runWithSignal,
   savePdf,
   screenshot,
   shutdownDaemon,
@@ -100,6 +109,8 @@ function textResult(text: string, details: unknown, structured?: unknown) {
 }
 
 function failed(tool: string, err: unknown, details: unknown) {
+  // User-cancelled (Escape) is not an error — the op was stopped on purpose.
+  if (err instanceof AbortError) return textResult(`${tool} aborted.`, details);
   return {
     ...textResult(`${tool} failed: ${err instanceof Error ? err.message : String(err)}`, details),
     isError: true,
@@ -116,6 +127,27 @@ function renderPage(page: { url: unknown; title: unknown; text: unknown; actions
 }
 
 export default function (pi: ExtensionAPI) {
+  // Route the harness AbortSignal (Escape) into every tool: the call rejects
+  // at once, drops the wedged session, and frees the mutex for the next call.
+  // Generic over the definition so params inference flows exactly as with
+  // pi.registerTool directly.
+  function abortable<TParams extends TSchema, TDetails>(
+    def: ToolDefinition<TParams, TDetails>,
+  ): ToolDefinition<TParams, TDetails> {
+    const inner = def.execute;
+    const execute = (
+      toolCallId: string,
+      params: Static<TParams>,
+      signal: AbortSignal | undefined,
+      onUpdate: AgentToolUpdateCallback<TDetails> | undefined,
+      ctx: ExtensionToolContext,
+    ): Promise<AgentToolResult<TDetails>> =>
+      runWithSignal(signal, () => inner(toolCallId, params, signal, onUpdate, ctx));
+    return { ...def, execute };
+  }
+  function registerTool<TParams extends TSchema, TDetails>(def: ToolDefinition<TParams, TDetails>): void {
+    pi.registerTool(abortable(def));
+  }
   // Close the browser session when the Pi session ends (no orphan windows).
   pi.on("session_shutdown", async () => {
     await closeSession().catch(() => undefined);
@@ -145,7 +177,7 @@ export default function (pi: ExtensionAPI) {
     return opts;
   };
 
-  pi.registerTool({
+  registerTool({
     name: "browser_search",
     label: "Search the web",
     description:
@@ -158,7 +190,7 @@ export default function (pi: ExtensionAPI) {
       "Use the navigate/act tools instead when the task needs logins, forms, or judging pages mid-task.",
     ],
     parameters: Type.Object({
-      query: Type.String({ description: "Search query (ignored when queries is set)." }),
+      query: Type.Optional(Type.String({ description: "Search query (ignored when queries is set)." })),
       queries: Type.Optional(Type.Array(Type.String(), { description: "Fan-out: several queries, merged URL-deduped. Errors surface per query." })),
       engine: Type.Optional(Type.Union(
         [Type.Literal("google"), Type.Literal("bing"),
@@ -205,6 +237,9 @@ export default function (pi: ExtensionAPI) {
             { queries: params.queries, results, errors },
           );
         }
+        if (!params.query) {
+          return failed("browser_search", "Pass query or queries.", { queries: params.queries, results: [] });
+        }
         const results = await search(params.query, base);
         const lines = results.map((r, i) =>
           `${i + 1}. ${r.title}\n   ${r.url}` +
@@ -222,7 +257,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
+  registerTool({
     name: "browser_open",
     label: "Open a page",
     description:
@@ -258,7 +293,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
+  registerTool({
     name: "browser_navigate",
     label: "Go to URL in session",
     description:
@@ -266,7 +301,7 @@ export default function (pi: ExtensionAPI) {
       "browser_act can use. Starts the session on first use.",
     parameters: Type.Object({
       url: Type.String({ description: "URL to navigate to." }),
-      headless: Type.Optional(Type.Boolean({ description: "Headless mode (applies when starting the shared browser; first starter wins)." })),
+      headless: Type.Optional(Type.Boolean({ description: "Headless mode. Default true (agent runs unseen); pass false for a visible window. Applies when starting the shared browser; first starter wins." })),
     }),
     execute: async (_toolCallId, params) => {
       try {
@@ -286,7 +321,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
+  registerTool({
     name: "browser_act",
     label: "Click or type in session",
     description:
@@ -312,7 +347,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
+  registerTool({
     name: "browser_press",
     label: "Press a key in session",
     description:
@@ -332,7 +367,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
+  registerTool({
     name: "browser_screenshot",
     label: "Screenshot session page",
     description:
@@ -355,7 +390,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
+  registerTool({
     name: "browser_back",
     label: "Go back in session",
     description: "Go back one history entry in the shared session and re-observe.",
@@ -371,7 +406,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
+  registerTool({
     name: "browser_forward",
     label: "Go forward in session",
     description: "Go forward one history entry in the shared session and re-observe.",
@@ -387,7 +422,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
+  registerTool({
     name: "browser_close",
     label: "Close browser session",
     description: "Close the shared browser session and release the profile. The next navigation reopens it.",
@@ -398,7 +433,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
+  registerTool({
     name: "browser_click_at",
     label: "Click at coordinates",
     description:
@@ -420,7 +455,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
+  registerTool({
     name: "browser_tabs",
     label: "List session tabs",
     description: "List open tabs (index/url/title) in the shared session for browser_tab_switch.",
@@ -437,7 +472,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
+  registerTool({
     name: "browser_tab_switch",
     label: "Switch session tab",
     description: "Switch the operated tab in the shared session (see browser_tabs), then re-observe.",
@@ -455,7 +490,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
+  registerTool({
     name: "browser_pdf",
     label: "Save page as PDF",
     description: "Save the current session page as a PDF file. Returns the file path.",
@@ -473,7 +508,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
+  registerTool({
     name: "browser_downloads",
     label: "List session downloads",
     description: "List files downloaded in this session (name, saved path, source url).",
@@ -490,7 +525,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
+  registerTool({
     name: "browser_find",
     label: "Find text in session",
     description: "Scroll the first visible match of the given text into view in the shared session, then re-observe.",
@@ -508,7 +543,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
+  registerTool({
     name: "browser_search_page",
     label: "Search page text",
     description:
@@ -539,7 +574,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
+  registerTool({
     name: "browser_wait",
     label: "Wait in session",
     description: "Wait a fixed number of seconds (max 30, for loading content), then re-observe.",
@@ -557,7 +592,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
+  registerTool({
     name: "browser_tab_close",
     label: "Close session tab",
     description: "Close one tab by index (see browser_tabs); never the last — browser_close ends the session.",
@@ -575,7 +610,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
+  registerTool({
     name: "browser_read",
     label: "Re-read session page",
     description:
@@ -594,7 +629,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
+  registerTool({
     name: "browser_video_transcript",
     label: "Get video transcript",
     description:
@@ -630,7 +665,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
+  registerTool({
     name: "browser_video_seek",
     label: "Seek session video",
     description:

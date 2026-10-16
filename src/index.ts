@@ -10,7 +10,7 @@ export type { DaemonInfo } from "./daemon.js";
 export { SimpleBrowser, formatPage } from "./simple.js";
 export { search, searchMany, open, detectWall, unwrapUrl, isJunkResult, looksRedirect, cleanMarkdown, registerEngine } from "./search.js";
 export type { SearchEngine, SearchResult, OpenedPage, BrowserOpts, EngineDef } from "./search.js";
-export { navigate, read, act, back, forward, press, screenshot, clickAt, savePdf, downloads, tabList, tabSwitch, tabClose, find, searchPage, wait, videoSeek, closeSession, resetSession, hasSession, openBlankTab, configureSession } from "./session.js";
+export { navigate, read, act, back, forward, press, screenshot, clickAt, savePdf, downloads, tabList, tabSwitch, tabClose, find, searchPage, wait, videoSeek, closeSession, resetSession, hasSession, openBlankTab, configureSession, runWithSignal, AbortError } from "./session.js";
 
 export { videoTranscript, videoIdFromUrl } from "./video.js";
 export type { VideoTranscript, TranscriptSegment } from "./video.js";

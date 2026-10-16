@@ -99,17 +99,22 @@ npx patchright install chromium   # one-time stealth-browser download
 pi install ./pi-shadow-browser
 ```
 
-No browser extension, no `--remote-debugging-port` setup. One visible browser
-shared by you and every agent: run `/browser-open` for a blank tab, sign in
-yourself — credentials never touch the agent — and every session sees the
-same logged-in window (`/browser-reset` wipes it).
+No browser extension, no `--remote-debugging-port` setup. Agents run headless
+by default; when you need eyes (first login, a wall, a visual check), run
+`/browser-open` for a headed blank tab, sign in yourself — credentials never
+touch the agent — and every session reuses the same logged-in profile
+(`/browser-reset` wipes it).
 
 ### Configuration
 
 ```jsonc
 // ~/.pi/agent/settings.json
-{ "shadowBrowser": { "headless": true, "profileDir": "…", "locale": "en-US", "timezone": "Asia/Kolkata" } }
+{ "shadowBrowser": { "headless": false, "profileDir": "…", "locale": "en-US", "timezone": "Asia/Kolkata" } }
 ```
+
+Defaults are agent-first: `headless: true`. Set it `false` for a visible
+browser, or pass `headless: false` on `browser_navigate` (first starter wins;
+`/browser-open` always opens headed).
 
 Precedence: tool args > `shadowBrowser` settings > defaults. One daemon serves
 the one shared browser every agent (and you) drives together;

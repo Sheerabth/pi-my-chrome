@@ -1,7 +1,7 @@
 /**
- * Browser daemon client: one shared visible Chromium for user and agents.
+ * Browser daemon client: one shared Chromium for user and agents.
  *
- * First starter launches it (headed by default — visibility is the point);
+ * First starter launches it (headless by default — agents don't watch);
  * everyone else attaches over CDP to the SAME default context: same tabs,
  * same cookie jar, no copies, no bridges. Rendezvous lives at
  * `<agentRoot>/daemon.json` ({ cdpUrl, pid, startedAt, headless }).
@@ -70,8 +70,9 @@ export function daemonRunnerPath(): string {
 
 /**
  * Return a live daemon endpoint, starting the daemon when needed.
- * Headed by default (visibility is the point); headless only when the
- * first starter configures it. Concurrent first-launchers serialize on
+ * Headless by default; headed only when the first starter configures it
+ * (manual login via /browser-open, or headless:false). Concurrent
+ * first-launchers serialize on
  * the profile lock, so only one daemon wins; losers re-read rendezvous.
  */
 /** Wait until no browser process uses this profile (bounded). */
@@ -148,7 +149,7 @@ export async function ensureDaemon(opts: { headless?: boolean; root?: string; pr
     } catch {
       // Best-effort.
     }
-    const headless = opts.headless ?? false;
+    const headless = opts.headless ?? true;
     const child = spawn(
       process.execPath,
       [daemonRunnerPath(), root, headless ? "headless" : "headed", ...(opts.proxyServer ? [`--proxy=${opts.proxyServer}`] : [])],

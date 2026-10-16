@@ -264,6 +264,16 @@ async function ensureKeeper() {
 
 const proxyArg = process.argv.find((a) => a.startsWith("--proxy="));
 const proxyServer = proxyArg ? proxyArg.slice("--proxy=".length) : "";
+// Launch flags mirror patchright's launch() tweaks where they are safe:
+//   --enable-automation is absent (removed by patchright)
+//   --disable-popup-blocking is absent (removed by patchright — and blocked
+//     popups break OAuth/login flows that open a second window).
+// Deliberately NOT carried: --disable-blink-features=AutomationControlled.
+// It does flip navigator.webdriver to false, but Chromium lists the whole
+// --disable-blink-features switch as unsupported (bad_flags_prompt.cc) and
+// shows a yellow "unsupported command-line flag" infobar on every headed
+// window — unacceptable on the manual-login window. Full Chromium with
+// --headless=new regardless (never Playwright's headless-shell binary).
 const args = [
   `--user-data-dir=${profileDir}`,
   "--remote-debugging-port=0",
@@ -271,7 +281,6 @@ const args = [
   "--no-default-browser-check",
   "--disable-session-crashed-bubble",
   "--disable-dev-shm-usage",
-  "--disable-popup-blocking",
   ...(headless ? ["--headless=new"] : []),
   ...(proxyServer ? [`--proxy-server=${proxyServer}`] : []),
 ];

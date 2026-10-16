@@ -364,6 +364,10 @@ async function runEngine(
   return runInTab(
     searchUrl,
     async (b) => {
+    // Time budget: on a walled engine each opaque redirect costs a
+    // click-navigate-restore cycle (~10s+); without a cap the loop grinds
+    // to the 150s session deadline. Over budget: stop resolving (cheap
+    // direct URLs still collect) and return whatever we have.
     let page = await b.observe();
     // Wall recovery (Google): consent accepts, sorry/blocked retries once after a
     // pause, homepage-bounce searches through the box like a human would.
@@ -418,6 +422,9 @@ async function runEngine(
       }
     }
 
+    const t0 = Date.now();
+    const BUDGET_MS = 90_000;
+    const overBudget = () => Date.now() - t0 > BUDGET_MS;
     const results: SearchResult[] = [];
     const seen = new Set<string>();
     const attempted = new Set<string>();
@@ -430,6 +437,10 @@ async function runEngine(
     let guard = 0;
     const debug = !!process.env.PI_SHADOW_DEBUG;
     while (results.length < maxResults && guard++ < maxResults * 3 + 5) {
+      if (overBudget()) {
+        if (debug) console.log(`[search] budget exceeded with ${results.length} results, stopping`);
+        break;
+      }
       const batch = (await b.evaluate(RESULTS_JS)) as { title: string; href: string; snippet: string }[];
       if (debug) console.log(`[search] iter=${guard} batch=${batch.length} have=${results.length}`);
       let progressed = false;
@@ -441,7 +452,7 @@ async function runEngine(
           progressed = true;
           continue;
         }
-        if (!looksRedirect(item.href) || attempted.has(item.title)) continue;
+        if (!looksRedirect(item.href) || attempted.has(item.title) || overBudget()) continue;
         attempted.add(item.title);
         const resolved = await resolveByClick(b, searchUrl, item.title, homeHost, siteSearch);
         if (resolved) push(item.title, resolved, item.snippet);

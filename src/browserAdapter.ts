@@ -267,7 +267,7 @@ export class AgentBrowserAdapter {
     }
     const root = agentRoot(opts.userDataDir);
     const { cdpUrl, headless: daemonHeadless, proxyServer: daemonProxy } = await ensureDaemon({
-      headless: opts.headless ?? false,
+      headless: opts.headless ?? true,
       root,
       ...(proxyServer ? { proxyServer } : {}),
     });

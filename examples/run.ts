@@ -1,6 +1,6 @@
 /** Example: search, open the top result, read it. No keys. */
 
-import { open, search } from "../src/index.js";
+import { closeSession, open, search } from "../src/index.js";
 import type { SearchEngine } from "../src/index.js";
 
 async function main(): Promise<void> {
@@ -24,7 +24,15 @@ function arg(args: string[], name: string): string | undefined {
   return i >= 0 ? args[i + 1] : undefined;
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+main()
+  .catch((err) => {
+    console.error(err);
+    process.exitCode = 1;
+  })
+  .finally(async () => {
+    // Release our window. The shared daemon (and its CDP websocket) stays
+    // up for other agents — but that open socket keeps the node event loop
+    // alive, so exit explicitly once our work is done.
+    await closeSession().catch(() => undefined);
+    process.exit(process.exitCode ?? 0);
+  });
