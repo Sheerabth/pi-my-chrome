@@ -1,8 +1,8 @@
 /**
  * Video senses: transcripts and seek, no keys, no decisions.
  *
- * Transcripts resolve in order: (1) InnerTube IOS client — caption URLs not
- * PO-gated, pure fetch; (2) yt-dlp binary with non-web clients. Seeking
+ * Transcripts come from the InnerTube IOS client (caption URLs not PO-gated,
+ * pure fetch) — one path, loud errors, no silent fallback. Seeking
  * drives the session's <video> element with code-owned scripts (time is
  * data, like coordinates). Pi does the watching; this file is eyes and ears.
  */

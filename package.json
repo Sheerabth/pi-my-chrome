@@ -1,7 +1,7 @@
 {
-  "name": "pi-my-chrome",
+  "name": "pi-shadow-browser",
   "version": "0.1.0",
-  "description": "Pi extension: Pi browses websites through your Chrome profile. Search, open, navigate, act.",
+  "description": "Pi extension: Pi browses websites through its own stealth browser. Search, open, navigate, act.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -9,10 +9,10 @@
     ".": "./dist/index.js"
   },
   "bin": {
-    "pi-my-chrome": "./dist/examples/run.js"
+    "pi-shadow-browser": "./dist/examples/run.js"
   },
   "scripts": {
-    "build": "tsc && cp -r vendor dist/vendor",
+    "build": "tsc && cp -r vendor dist/vendor && cp src/daemonRunner.mjs dist/src/daemonRunner.mjs",
     "typecheck": "tsc --noEmit",
     "run": "tsx examples/run.ts",
     "run:simple": "tsx examples/run_simple.ts"
@@ -25,12 +25,11 @@
   ],
   "pi": {
     "extensions": [
-      "./pi-extension/my-chrome.ts"
+      "./pi-extension/shadow-browser.ts"
     ]
   },
   "dependencies": {
-    "cloakbrowser": "^0.6.0",
-    "playwright-core": "^1.63.0"
+    "patchright": "^1.64.1"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "1.1.0",

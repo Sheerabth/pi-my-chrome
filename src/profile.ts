@@ -1,144 +1,118 @@
 /**
- * Profile manager: snapshot the live Chrome Default into a throwaway dir.
+ * Agent profile manager: a persistent throwaway dir for the agent browser.
  *
- * Never launches on the real dir (SingletonLock). The agent browser always
- * runs on the copy, so the user's open Chrome is untouched and sees nothing.
+ * The agent runs its OWN browser identity (separate from the user's Chrome):
+ * log in once inside the agent browser and the session persists here across
+ * runs. Nothing is ever copied from — or written to — the real profile.
  *
- * Selective copy: the agent Chromium (CloakBrowser) may be older than the
- * system Chrome. A full Default/ copy carries version-skewed state that can
- * crash the older binary on startup. We copy only login-relevant files and
- * let the agent browser create everything else fresh.
+ * Two invariants:
+ * - Only one browser per profile dir (file lock + in-process mutex pair).
+ * - The dir stays private to the user (0700).
  */
 
 import { execFileSync } from "node:child_process";
-import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { chmodSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-function candidateDefaults(): string[] {
-  const home = homedir();
-  return [
-    join(home, ".config/google-chrome/Default"), // Linux
-    join(home, ".config/chromium/Default"), // Linux (Chromium)
-    join(home, "Library/Application Support/Google/Chrome/Default"), // macOS
-  ];
-}
-
-export function realDefault(override?: string): string {
-  if (override) return override;
-  if (process.env.PI_MY_CHROME_REAL) return process.env.PI_MY_CHROME_REAL;
-  for (const cand of candidateDefaults()) {
-    if (existsSync(cand)) return cand;
-  }
-  return candidateDefaults()[0];
-}
-
 export function agentRoot(override?: string): string {
-  return override ?? process.env.PI_MY_CHROME_DIR ?? "/tmp/agent-chrome";
+  return override ?? "/tmp/agent-chrome";
 }
 
-export function agentDefault(): string {
-  return join(agentRoot(), "Default");
-}
-
-/** Login-relevant entries, relative to Default/. Journals ride along when present. */
-const AUTH_ENTRIES = [
-  "Cookies",
-  "Login Data",
-  "Login Data For Account",
-  "Web Data",
-  "Preferences",
-  "Secure Preferences",
-  "Account Web Data",
-  "Local Storage",
-  "Session Storage",
-];
-
-/** Never copy: process locks, caches, heavy history, extensions (stealth risk). */
-const SKIP_NAMES = new Set([
-  "Cache",
-  "Code Cache",
-  "GPUCache",
-  "CacheStorage",
-  "SingletonLock",
-  "SingletonCookie",
-  "SingletonSocket",
-  "History",
-  "Extensions",
-]);
-
-function haveRsync(): boolean {
+/** Create the agent root with private permissions (idempotent). */
+export function ensureAgentRoot(root?: string): string {
+  const dir = root ?? agentRoot();
+  mkdirSync(dir, { recursive: true });
   try {
-    execFileSync("rsync", ["--version"], { stdio: "ignore" });
-    return true;
+    chmodSync(dir, 0o700);
   } catch {
+    // Best-effort (non-POSIX filesystems).
+  }
+  return dir;
+}
+
+export function wipeProfileCopy(root?: string): string {
+  const dir = root ?? agentRoot();
+  rmSync(dir, { recursive: true, force: true });
+  return dir;
+}
+
+/** Lock state in plain words. Never throws — diagnostics only.
+ *  `stale` means no live browser behind the lock (safe to clear). */
+export function profileLockInfo(root?: string): { locked: boolean; stale: boolean } {
+  const dir = `${root ?? agentRoot()}.lock`;
+  try {
+    readFileSync(join(dir, "pid"), "utf8");
+  } catch {
+    return { locked: false, stale: false };
+  }
+  const r = root ?? agentRoot();
+  return { locked: true, stale: !isProfileInUse(r) };
+}
+
+/** True when a live browser process is actually using this profile dir.
+ *  Matches the exact --user-data-dir=<root>/browser (plus --user-data-dir=
+ *  <root> fallback) NUL-bounded in /proc/<pid>/cmdline, skipping self and
+ *  parent and requiring chrome in cmdline — so /tmp/pr never matches
+ *  /tmp/pr-other and never matches a shell command containing the string.
+ *  Falls back to pgrep (exact, self-excluding) when /proc is unavailable.
+ *  Fail-closed: if we cannot tell (no pgrep), assume in use. */
+export function isProfileInUse(root?: string): boolean {
+  const dir = root ?? agentRoot();
+  const viaProc = isProfileInUseProc(dir);
+  if (viaProc !== null) return viaProc;
+  try {
+    const out = execFileSync("pgrep", ["-af", `user-data-dir=${join(dir, "browser")}`], { encoding: "utf8" });
+    const me = new Set([String(process.pid), String(process.ppid)]);
+    for (const line of out.split("\n").filter(Boolean)) {
+      const pid = line.split(" ")[0];
+      if (me.has(pid)) continue;
+      if (!line.includes(`--user-data-dir=${join(dir, "browser")}`)) continue;
+      if (!/chrome/i.test(line)) continue;
+      return true;
+    }
     return false;
+  } catch (err) {
+    // Exit status 1 = no match (free). Anything else (no pgrep,
+    // permission errors) = cannot tell, assume in use.
+    return (err as { status?: unknown })?.status !== 1;
   }
 }
 
-export function ensureProfileCopy(opts: { real?: string; root?: string } = {}): string {
-  const real = realDefault(opts.real);
-  const root = agentRoot(opts.root);
-  const dest = join(root, "Default");
-  if (!existsSync(real)) {
-    throw new Error(`real Chrome profile not found: ${real}`);
+function isProfileInUseProc(dir: string): boolean | null {
+  const exactBrowser = `--user-data-dir=${join(dir, "browser")}`;
+  const exactRoot = `--user-data-dir=${dir}`;
+  let entries: string[];
+  try {
+    entries = readdirSync("/proc");
+  } catch {
+    return null;
   }
-  mkdirSync(dest, { recursive: true });
-
-  if (haveRsync()) {
-    for (const entry of AUTH_ENTRIES) {
-      const src = join(real, entry);
-      if (!existsSync(src)) continue;
-      const args = ["-a"];
-      // Directories: copy contents, skipping volatile/heavy names.
-      if (statSync(src).isDirectory()) {
-        for (const skip of SKIP_NAMES) args.push("--exclude", skip);
-        args.push(`${src}/`, `${join(dest, entry)}/`);
-      } else {
-        args.push(src, join(dest, entry));
-      }
+  try {
+    const me = new Set([process.pid, process.ppid]);
+    for (const e of entries) {
+      if (!/^\d+$/.test(e)) continue;
+      const pid = Number(e);
+      if (me.has(pid)) continue;
+      let args: string[];
       try {
-        execFileSync("rsync", args, { stdio: "pipe", timeout: 120_000 });
-      } catch (err) {
-        throw new Error(`profile copy failed for ${entry}: ${String(err).slice(0, 300)}`);
+        args = readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0");
+      } catch {
+        continue;
       }
-      const journal = `${entry}-journal`;
-      if (existsSync(join(real, journal))) {
-        try {
-          execFileSync("rsync", ["-a", join(real, journal), join(dest, journal)], { stdio: "pipe", timeout: 30_000 });
-        } catch {
-          // Journals are best-effort.
-        }
-      }
+      if (!args.some((a) => a === exactBrowser || a === exactRoot)) continue;
+      if (!/chrome/i.test(args.join(" "))) continue;
+      return true;
     }
-  } else {
-    for (const entry of AUTH_ENTRIES) {
-      const src = join(real, entry);
-      if (!existsSync(src)) continue;
-      cpSync(src, join(dest, entry), {
-        recursive: true,
-        filter: (p) => !SKIP_NAMES.has(p.split("/").pop() ?? "") && !p.endsWith(".log"),
-      });
-      const journal = join(real, `${entry}-journal`);
-      if (existsSync(journal)) cpSync(journal, join(dest, `${entry}-journal`));
-    }
+    return false;
+  } catch {
+    return null;
   }
-
-  for (const stale of SKIP_NAMES) {
-    try {
-      unlinkSync(join(dest, stale));
-    } catch {
-      // Absent, or a directory — either way not a stale lock file.
-    }
-  }
-  chmodSync(root, 0o700);
-  return root;
 }
 
-export function wipeProfileCopy(): void {
-  rmSync(agentRoot(), { recursive: true, force: true });
-}
-
+/** Remove the lock only when it is safe: never while a live browser uses
+ *  the profile, and never yank a lock a fresh launcher just made (owner
+ *  alive + young lock = browser may still be spawning, keep waiting).
+ *  A provably dead owner with no browser behind it clears at once. */
 function pidAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -146,6 +120,42 @@ function pidAlive(pid: number): boolean {
   } catch {
     return false;
   }
+}
+
+function tryClearStaleLock(lockDir: string, maxAgeMs: number): boolean {
+  try {
+    const root = lockDir.endsWith(".lock") ? lockDir.slice(0, -".lock".length) : lockDir;
+    if (isProfileInUse(root)) return false;
+    let owner: "dead" | "alive" | "unknown" = "unknown";
+    try {
+      const pid = Number(readFileSync(join(lockDir, "pid"), "utf8").trim());
+      owner = Number.isFinite(pid) && pidAlive(pid) ? "alive" : "dead";
+    } catch {
+      owner = "unknown";
+    }
+    if (owner === "dead") {
+      rmSync(lockDir, { recursive: true, force: true });
+      return true;
+    }
+    const mtime = statSync(join(lockDir, "pid")).mtimeMs;
+    if (Date.now() - mtime < maxAgeMs) return false;
+    rmSync(lockDir, { recursive: true, force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Remove a stale lock file (no live browser behind it). Returns true when
+ *  anything was removed. Explicit user intent only — never called silently. */
+export function clearStaleLock(root?: string): boolean {
+  const dir = `${root ?? agentRoot()}.lock`;
+  try {
+    readFileSync(join(dir, "pid"), "utf8");
+  } catch {
+    return false;
+  }
+  return tryClearStaleLock(dir, 120_000);
 }
 
 /** Cross-process lock: two Chromium instances on one profile dir corrupt it.
@@ -165,15 +175,10 @@ export async function acquireProfileLock(root?: string, timeoutMs = 120_000): Pr
       };
     } catch (err) {
       if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") throw err;
-      try {
-        const pid = Number(readFileSync(join(dir, "pid"), "utf8").trim());
-        if (!Number.isFinite(pid) || !pidAlive(pid)) {
-          rmSync(dir, { recursive: true, force: true });
-          continue;
-        }
-      } catch {
-        // Unreadable lock — retry until timeout.
-      }
+      // Dead owner, orphaned browserless lock, or live contender still
+      // launching: only a lock with no live browser behind it AND older
+      // than our whole patience window may go. Otherwise keep waiting.
+      if (tryClearStaleLock(dir, timeoutMs)) continue;
       if (Date.now() > deadline) {
         throw new Error(`Timed out waiting for profile lock ${dir}; another agent run may be active.`);
       }

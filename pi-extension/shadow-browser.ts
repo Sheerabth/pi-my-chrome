@@ -3,27 +3,29 @@
  *
  * No decision models, no micro-loops, no keys. Pi is the agent loop; this
  * package is its hands: search, open, observe-with-actions, act, back,
- * forward — on one persistent session over the user's Chrome profile copy.
+ * forward — on one persistent session in its own stealth browser
+ * (separate agent identity; never touches your Chrome).
  *
  * Install as a Pi package (`pi install <this-dir>`) or load directly:
- * `pi --extension ./pi-extension/my-chrome.ts`.
+ * `pi --extension ./pi-extension/shadow-browser.ts`.
  *
  * Registers: browser_search, browser_open, browser_navigate, browser_act,
  * browser_press, browser_screenshot, browser_click_at, browser_tabs,
  * browser_tab_switch, browser_tab_close, browser_pdf, browser_downloads,
  * browser_find, browser_search_page, browser_wait, browser_back,
- * browser_forward, browser_close, browser_reset — plus /chrome-config.
+ * browser_forward, browser_close — plus /browser-config,
+ * /browser-open, /browser-reset and /browser-shutdown.
  *
  * Settings (highest precedence first):
  *   1. tool arguments (`headless` where offered)
- *   2. Pi settings `myChrome` section (`~/.pi/agent/settings.json`):
- *      `{ "myChrome": { "headless": true, "profileDir": "…", "locale": "…" } }`
- *   3. process environment (`PI_MY_CHROME_DIR`, `PI_MY_CHROME_REAL`,
- *      `AGENTSEARCH_HEADLESS`, `PI_MY_CHROME_LOCALE/TIMEZONE/PROXY`)
- *   4. `.env` in Pi's working directory (auto-loaded, managed keys only)
- *   5. built-in defaults
+ *   2. Pi settings `shadowBrowser` section (`~/.pi/agent/settings.json`):
+ *      `{ "shadowBrowser": { "headless": true, "profileDir": "…", "locale": "…" } }`
+ *   3. built-in defaults
  */
 
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import { Type } from "typebox";
 import type { JsonValue } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -32,19 +34,24 @@ import {
   back,
   clickAt,
   closeSession,
+  configureSession,
   downloads,
-  ensureEnv,
   find,
   forward,
   hasSession,
   loadConfig,
+  daemonStatus,
   navigate,
+  open,
+  openBlankTab,
   press,
+  profileLockInfo,
   read,
   redacted,
   resetSession,
   savePdf,
   screenshot,
+  shutdownDaemon,
   search,
   searchMany,
   searchPage,
@@ -57,19 +64,18 @@ import {
 } from "../src/index.js";import type { ChromeConfig } from "../src/index.js";
 
 /**
- * Map the Pi settings `myChrome` section to config overrides.
+ * Map the Pi settings `shadowBrowser` section to config overrides.
  * Pure — tested without Pi. Unknown/mistyped fields are ignored.
  */
-export function myChromeOverrides(settings: unknown): Partial<ChromeConfig> {
+export function shadowBrowserOverrides(settings: unknown): Partial<ChromeConfig> {
   const section =
     typeof settings === "object" && settings !== null
-      ? (settings as { myChrome?: unknown }).myChrome
+      ? (settings as { shadowBrowser?: unknown }).shadowBrowser
       : undefined;
   if (typeof section !== "object" || section === null) return {};
   const get = (k: string) => (section as Record<string, unknown>)[k];
   const out: Partial<ChromeConfig> = {};
   if (typeof get("profileDir") === "string") out.profileDir = get("profileDir") as string;
-  if (typeof get("realProfile") === "string") out.realProfile = get("realProfile") as string;
   if (typeof get("headless") === "boolean") out.headless = get("headless") as boolean;
   if (typeof get("locale") === "string") out.locale = get("locale") as string;
   if (typeof get("timezone") === "string") out.timezone = get("timezone") as string;
@@ -94,7 +100,10 @@ function textResult(text: string, details: unknown, structured?: unknown) {
 }
 
 function failed(tool: string, err: unknown, details: unknown) {
-  return textResult(`${tool} failed: ${err instanceof Error ? err.message : String(err)}`, details);
+  return {
+    ...textResult(`${tool} failed: ${err instanceof Error ? err.message : String(err)}`, details),
+    isError: true,
+  };
 }
 
 /** Render an observed page the way Pi navigates by: text + action ids. */
@@ -107,16 +116,34 @@ function renderPage(page: { url: unknown; title: unknown; text: unknown; actions
 }
 
 export default function (pi: ExtensionAPI) {
+  // Close the browser session when the Pi session ends (no orphan windows).
+  pi.on("session_shutdown", async () => {
+    await closeSession().catch(() => undefined);
+  });
   // Settings are read lazily per call: ExtensionAPI methods like
   // getSettings() cannot run during extension loading, only after startup.
   const settingsOverrides = (): Partial<ChromeConfig> => {
     try {
-      return myChromeOverrides(pi.getSettings());
+      return shadowBrowserOverrides(pi.getSettings());
     } catch {
       return {};
     }
   };
-  const sessionOpts = () => loadConfig(settingsOverrides());
+  // In-memory overrides from /browser-config: apply instantly (no /reload),
+  // merged on top of settings. Engine keys (profileDir/headless/proxy)
+  // additionally close the live session so the next op rebinds engines.
+  let runtimeOverrides: Partial<ChromeConfig> = {};
+  const sessionOpts = () => {
+    const opts = loadConfig({ ...settingsOverrides(), ...runtimeOverrides });
+    configureSession({
+      profileDir: opts.profileDir,
+      headless: opts.headless,
+      locale: opts.locale,
+      timezone: opts.timezone,
+      proxy: opts.proxy,
+    });
+    return opts;
+  };
 
   pi.registerTool({
     name: "browser_search",
@@ -154,15 +181,15 @@ export default function (pi: ExtensionAPI) {
       errors: Type.Optional(Type.Array(Type.Object({ query: Type.String(), error: Type.String() }))),
     }),
     execute: async (_toolCallId, params) => {
-      ensureEnv();
       try {
-        const cfg = loadConfig(settingsOverrides());
+        const cfg = sessionOpts();
         const base = {
           engine: (params.engine ?? "google") as "google",
           maxResults: Math.min(params.maxResults ?? 5, 50),
           depth: Math.min(params.depth ?? 0, 5),
           headless: cfg.headless,
           profileDir: cfg.profileDir,
+          proxy: cfg.proxy,
         };
         if (params.queries && params.queries.length > 0) {
           const { results, errors } = await searchMany(params.queries.slice(0, 10), base);
@@ -217,12 +244,11 @@ export default function (pi: ExtensionAPI) {
       description: Type.Optional(Type.String()),
     }),
     execute: async (_toolCallId, params) => {
-      ensureEnv();
       try {
-        const page = await navigate(params.url, sessionOpts());
+        const page = await open(params.url, sessionOpts());
         const structured: Record<string, unknown> = { url: page.url, title: page.title, text: page.text };
         for (const k of ["author", "published", "description"] as const) {
-          const v = (page as Record<string, unknown>)[k];
+          const v = (page as unknown as Record<string, unknown>)[k];
           if (typeof v === "string" && v) structured[k] = v;
         }
         return textResult(`Title: ${page.title}\nURL: ${page.url}\n\n${page.text.slice(0, 4000)}`, page, structured);
@@ -240,13 +266,12 @@ export default function (pi: ExtensionAPI) {
       "browser_act can use. Starts the session on first use.",
     parameters: Type.Object({
       url: Type.String({ description: "URL to navigate to." }),
-      headless: Type.Optional(Type.Boolean({ description: "Headless mode (applies when opening the session)." })),
+      headless: Type.Optional(Type.Boolean({ description: "Headless mode (applies when starting the shared browser; first starter wins)." })),
     }),
     execute: async (_toolCallId, params) => {
-      ensureEnv();
       try {
-        const fromSettings = settingsOverrides();
-        const cfg = loadConfig({ ...fromSettings, headless: params.headless ?? fromSettings.headless });
+        const base = sessionOpts();
+        const cfg = loadConfig({ ...base, headless: params.headless ?? base.headless });
         const page = await navigate(params.url, {
           headless: cfg.headless,
           profileDir: cfg.profileDir,
@@ -277,8 +302,8 @@ export default function (pi: ExtensionAPI) {
       files: Type.Optional(Type.Array(Type.String(), { description: "Local file paths (upload actions only)." })),
     }),
     execute: async (_toolCallId, params) => {
-      ensureEnv();
       try {
+        sessionOpts();
         const page = await act(params.actionId, params.text, params.files);
         return textResult(renderPage(page), page);
       } catch (err) {
@@ -297,8 +322,8 @@ export default function (pi: ExtensionAPI) {
       key: Type.String({ description: "Key name, e.g. Escape, Enter, Tab, ArrowDown, a." }),
     }),
     execute: async (_toolCallId, params) => {
-      ensureEnv();
       try {
+        sessionOpts();
         const page = await press(params.key);
         return textResult(renderPage(page), page);
       } catch (err) {
@@ -317,8 +342,8 @@ export default function (pi: ExtensionAPI) {
       fullPage: Type.Optional(Type.Boolean({ description: "Capture the full scrollable page. Default false (viewport)." })),
     }),
     execute: async (_toolCallId, params) => {
-      ensureEnv();
       try {
+        sessionOpts();
         const shot = await screenshot(params.fullPage ?? false);
         return {
           content: [{ type: "image" as const, data: shot.data, mimeType: shot.mimeType }],
@@ -336,8 +361,8 @@ export default function (pi: ExtensionAPI) {
     description: "Go back one history entry in the shared session and re-observe.",
     parameters: Type.Object({}),
     execute: async () => {
-      ensureEnv();
       try {
+        sessionOpts();
         const page = await back();
         return textResult(renderPage(page), page);
       } catch (err) {
@@ -352,8 +377,8 @@ export default function (pi: ExtensionAPI) {
     description: "Go forward one history entry in the shared session and re-observe.",
     parameters: Type.Object({}),
     execute: async () => {
-      ensureEnv();
       try {
+        sessionOpts();
         const page = await forward();
         return textResult(renderPage(page), page);
       } catch (err) {
@@ -385,8 +410,8 @@ export default function (pi: ExtensionAPI) {
       y: Type.Number({ description: "Vertical CSS pixel in the current viewport." }),
     }),
     execute: async (_toolCallId, params) => {
-      ensureEnv();
       try {
+        sessionOpts();
         const page = await clickAt(params.x, params.y);
         return textResult(renderPage(page), page);
       } catch (err) {
@@ -401,8 +426,8 @@ export default function (pi: ExtensionAPI) {
     description: "List open tabs (index/url/title) in the shared session for browser_tab_switch.",
     parameters: Type.Object({}),
     execute: async () => {
-      ensureEnv();
       try {
+        sessionOpts();
         const tabs = await tabList();
         const lines = tabs.map((t) => `${t.index}: ${t.title || "(no title)"}\n   ${t.url}`);
         return textResult(lines.length > 0 ? lines.join("\n") : "No tabs open.", { tabs });
@@ -420,8 +445,8 @@ export default function (pi: ExtensionAPI) {
       index: Type.Number({ description: "Tab index from browser_tabs." }),
     }),
     execute: async (_toolCallId, params) => {
-      ensureEnv();
       try {
+        sessionOpts();
         const page = await tabSwitch(params.index);
         return textResult(renderPage(page), page);
       } catch (err) {
@@ -438,8 +463,8 @@ export default function (pi: ExtensionAPI) {
       path: Type.Optional(Type.String({ description: "Where to save. Default: a temp file." })),
     }),
     execute: async (_toolCallId, params) => {
-      ensureEnv();
       try {
+        sessionOpts();
         const path = await savePdf(params.path);
         return textResult(`Saved PDF to ${path}`, { path });
       } catch (err) {
@@ -454,8 +479,8 @@ export default function (pi: ExtensionAPI) {
     description: "List files downloaded in this session (name, saved path, source url).",
     parameters: Type.Object({}),
     execute: async () => {
-      ensureEnv();
       try {
+        sessionOpts();
         const files = await downloads();
         const lines = files.map((f) => `${f.name}\n   ${f.path}`);
         return textResult(lines.length > 0 ? lines.join("\n") : "No downloads yet.", { files });
@@ -473,8 +498,8 @@ export default function (pi: ExtensionAPI) {
       text: Type.String({ description: "Text to find (case-insensitive)." }),
     }),
     execute: async (_toolCallId, params) => {
-      ensureEnv();
       try {
+        sessionOpts();
         const page = await find(params.text);
         return textResult(renderPage(page), page);
       } catch (err) {
@@ -497,8 +522,8 @@ export default function (pi: ExtensionAPI) {
       maxResults: Type.Optional(Type.Number({ description: "Max hits. Default 10." })),
     }),
     execute: async (_toolCallId, params) => {
-      ensureEnv();
       try {
+        sessionOpts();
         const out = await searchPage(params.pattern, {
           regex: params.regex,
           caseSensitive: params.caseSensitive,
@@ -522,8 +547,8 @@ export default function (pi: ExtensionAPI) {
       seconds: Type.Number({ description: "Seconds to wait, 0–30." }),
     }),
     execute: async (_toolCallId, params) => {
-      ensureEnv();
       try {
+        sessionOpts();
         const page = await wait(params.seconds);
         return textResult(renderPage(page), page);
       } catch (err) {
@@ -540,30 +565,12 @@ export default function (pi: ExtensionAPI) {
       index: Type.Number({ description: "Tab index from browser_tabs." }),
     }),
     execute: async (_toolCallId, params) => {
-      ensureEnv();
       try {
+        sessionOpts();
         const page = await tabClose(params.index);
         return textResult(renderPage(page), page);
       } catch (err) {
         return failed("browser_tab_close", err, { index: params.index });
-      }
-    },
-  });
-
-  pi.registerTool({
-    name: "browser_reset",
-    label: "Reset browser state",
-    description:
-      "Close the session and wipe the throwaway profile copy. Next navigation starts fresh from the " +
-      "real profile. Use for poisoned state, endless walls, or a clean slate.",
-    parameters: Type.Object({}),
-    execute: async () => {
-      ensureEnv();
-      try {
-        await resetSession();
-        return textResult("Browser session closed and profile copy wiped. Next navigation starts fresh.", { open: hasSession() });
-      } catch (err) {
-        return failed("browser_reset", err, {});
       }
     },
   });
@@ -577,8 +584,8 @@ export default function (pi: ExtensionAPI) {
       "freshness without losing form or app state to a reload.",
     parameters: Type.Object({}),
     execute: async () => {
-      ensureEnv();
       try {
+        sessionOpts();
         const page = await read();
         return textResult(renderPage(page), page);
       } catch (err) {
@@ -634,8 +641,8 @@ export default function (pi: ExtensionAPI) {
       seconds: Type.Number({ description: "Timestamp to seek to, in seconds." }),
     }),
     execute: async (_toolCallId, params) => {
-      ensureEnv();
       try {
+        sessionOpts();
         await videoSeek(params.seconds);
         const shot = await screenshot();
         return {
@@ -651,15 +658,212 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerCommand("chrome-config", {
-    description: "Show the resolved my-chrome configuration (no secrets exist to leak).",
+  /** Settable shadowBrowser keys (personal settings only). */
+  const CONFIG_KEYS = ["profileDir", "headless", "locale", "timezone", "proxy"] as const;
+  type ConfigKey = (typeof CONFIG_KEYS)[number];
+  const isConfigKey = (k: string): k is ConfigKey =>
+    (CONFIG_KEYS as readonly string[]).includes(k);
+
+  function settingsFilePath(): string {
+    return join(homedir(), ".pi", "agent", "settings.json");
+  }
+
+  function readSettingsFile(): { data: Record<string, unknown>; file: string } {
+    const file = settingsFilePath();
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(file, "utf8"));
+      if (typeof parsed !== "object" || parsed === null) throw new Error("not a JSON object");
+      return { data: parsed as Record<string, unknown>, file };
+    } catch (err) {
+      // Missing settings.json means "no settings yet" — start from {} so
+      // /browser-config works on a fresh install. Anything else surfaces.
+      if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return { data: {}, file };
+      throw new Error(`Cannot read settings at ${file}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /** Set (or with value undefined, clear) one shadowBrowser key. Returns the file written. */
+  function writeShadowBrowserKey(key: ConfigKey, value: string | boolean | undefined): string {
+    const { data, file } = readSettingsFile();
+    const raw = data.shadowBrowser;
+    const section: Record<string, unknown> =
+      typeof raw === "object" && raw !== null ? { ...(raw as Record<string, unknown>) } : {};
+    if (value === undefined) delete section[key];
+    else section[key] = value;
+    if (Object.keys(section).length === 0) delete data.shadowBrowser;
+    else data.shadowBrowser = section;
+    try {
+      mkdirSync(dirname(file), { recursive: true });
+      writeFileSync(file, `${JSON.stringify(data, null, 2)}\n`);
+    } catch (err) {
+      throw new Error(`Cannot write settings at ${file}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return file;
+  }
+
+  /** Drop the whole shadowBrowser section. Returns the file written. */
+  function clearShadowBrowserSection(): string {
+    const { data, file } = readSettingsFile();
+    delete data.shadowBrowser;
+    try {
+      mkdirSync(dirname(file), { recursive: true });
+      writeFileSync(file, `${JSON.stringify(data, null, 2)}\n`);
+    } catch (err) {
+      throw new Error(`Cannot write settings at ${file}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return file;
+  }
+
+  const ENGINE_KEYS: ReadonlySet<ConfigKey> = new Set(["profileDir", "headless", "proxy"]);
+  /** Apply a config change immediately: in-memory override + engine rebind
+   *  for engine keys (next op opens on the new engine, no /reload). */
+  async function applyConfigChange(key: ConfigKey | "*", value: string | boolean | undefined): Promise<void> {
+    if (key === "*") {
+      runtimeOverrides = {};
+    } else if (value === undefined) {
+      delete runtimeOverrides[key];
+    } else {
+      (runtimeOverrides as Record<string, unknown>)[key] = value;
+    }
+    sessionOpts();
+    if (key === "*" || ENGINE_KEYS.has(key as ConfigKey)) {
+      if (hasSession()) await closeSession().catch(() => undefined);
+    }
+  }
+
+  pi.registerCommand("browser-config", {
+    description: "Show or change the shadow-browser configuration (settings.json shadowBrowser section).",
+    getArgumentCompletions: (prefix) => {
+      const words = prefix.trimStart().split(/\s+/);
+      if (words.length <= 1) {
+        const p = words[0] ?? "";
+        const hit = [...CONFIG_KEYS, "reset"].filter((c) => c.startsWith(p));
+        return hit.length > 0 ? hit.map((c) => ({ value: `${c} `, label: c })) : null;
+      }
+      if (words[0] === "headless" && words.length === 2) {
+        return ["true", "false"].filter((v) => v.startsWith(words[1])).map((value) => ({ value, label: value }));
+      }
+      return null;
+    },
+    handler: async (args, ctx) => {
+      const parts = args.trim().split(/\s+/).filter(Boolean);
+      if (parts.length === 0) {
+        try {
+          const cfg = sessionOpts();
+        const lock = profileLockInfo(cfg.profileDir);
+        const summary = {
+          ...redacted(cfg),
+          session: hasSession() ? "open" : "closed",
+          lock: !lock.locked ? "free" : lock.stale ? "stale (clears on next use)" : "in use by another session",
+        };
+        const text = Object.entries(summary)
+          .map(([k, v]) => `${k}: ${v}`)
+          .join("\n");
+        ctx.ui.notify(`shadow-browser config (tool args > shadowBrowser settings > defaults):\n${text}`, "info");
+      } catch (err) {
+        ctx.ui.notify(`/browser-config failed: ${err instanceof Error ? err.message : String(err)}`, "error");
+        return;
+      }
+        return;
+      }
+      const [key, ...rest] = parts;
+      if (key === "reset") {
+        if (rest.length === 0) {
+          try {
+            const file = clearShadowBrowserSection();
+            await applyConfigChange("*", undefined);
+            ctx.ui.notify(`Cleared shadowBrowser section (${file}). Next browser use opens on defaults.`, "info");
+          } catch (err) {
+            ctx.ui.notify(`/browser-config failed: ${err instanceof Error ? err.message : String(err)}`, "error");
+          }
+          return;
+        }
+        if (rest.length === 1 && isConfigKey(rest[0])) {
+          try {
+            const file = writeShadowBrowserKey(rest[0], undefined);
+            await applyConfigChange(rest[0], undefined);
+            ctx.ui.notify(`Cleared ${rest[0]} (${file}). Applies immediately.`, "info");
+          } catch (err) {
+            ctx.ui.notify(`/browser-config failed: ${err instanceof Error ? err.message : String(err)}`, "error");
+          }
+          return;
+        }
+        ctx.ui.notify(`Usage: /browser-config reset [${CONFIG_KEYS.join(" | ")}]`, "warning");
+        return;
+      }
+      if (!isConfigKey(key)) {
+        ctx.ui.notify(
+          `Unknown setting ${JSON.stringify(key)} — known: ${CONFIG_KEYS.join(", ")}, reset. Usage: /browser-config [key value | reset [key]]`,
+          "warning",
+        );
+        return;
+      }
+      if (rest.length === 0) {
+        const value = (redacted(sessionOpts()) as Record<string, unknown>)[key];
+        ctx.ui.notify(`${key}: ${String(value)}`, "info");
+        return;
+      }
+      let value: string | boolean;
+      if (key === "headless") {
+        const norm = rest.join(" ").toLowerCase();
+        if (norm === "true" || norm === "1") value = true;
+        else if (norm === "false" || norm === "0") value = false;
+        else {
+          ctx.ui.notify(`headless wants true or false, got ${JSON.stringify(rest.join(" "))}.`, "warning");
+          return;
+        }
+      } else {
+        value = rest.join(" ");
+      }
+      try {
+        const file = writeShadowBrowserKey(key, value);
+        await applyConfigChange(key, value);
+        ctx.ui.notify(`Set ${key} = ${typeof value === "string" ? value : String(value)} (${file}). Applies immediately.`, "info");
+      } catch (err) {
+        ctx.ui.notify(`/browser-config failed: ${err instanceof Error ? err.message : String(err)}`, "error");
+      }
+    },
+  });
+
+  pi.registerCommand("browser-open", {
+    description: "Open a blank tab in this session's window for manual use (log in by hand). Focused for you.",
     handler: async (_args, ctx) => {
-      ensureEnv();
-      const summary = redacted(loadConfig(settingsOverrides()));
-      const text = Object.entries(summary)
-        .map(([k, v]) => `${k}: ${v}`)
-        .join("\n");
-      ctx.ui.notify(`my-chrome config (Pi settings myChrome > env > .env):\n${text}`, "info");
+      try {
+        // Operates on THIS session's window: focuses the existing blank tab
+        // or opens one blank tab in-window (never duplicates, never another
+        // agent's window). A headless daemon is invisible by definition —
+        // the session restarts it visible instead of opening unseen tabs.
+        const before = daemonStatus(sessionOpts().profileDir);
+        await openBlankTab({ ...sessionOpts(), headless: false });
+        if (before && before.headless) ctx.ui.notify("Shared browser was headless (invisible) — restarted it visible.", "info");
+        ctx.ui.notify("Blank tab opened and focused - log in as needed.", "info");
+      } catch (err) {
+        ctx.ui.notify(`/browser-open failed: ${err instanceof Error ? err.message : String(err)}`, "error");
+      }
+    },
+  });
+
+  pi.registerCommand("browser-shutdown", {
+    description: "Stop the shared browser daemon (all agent sessions lose their browser).",
+    handler: async (_args, ctx) => {
+      try {
+        const stopped = await shutdownDaemon(sessionOpts().profileDir);
+        ctx.ui.notify(stopped ? "Browser daemon stopped. Next navigation relaunches it." : "No browser daemon was running.", "info");
+      } catch (err) {
+        ctx.ui.notify(`/browser-shutdown failed: ${err instanceof Error ? err.message : String(err)}`, "error");
+      }
+    },
+  });
+
+  pi.registerCommand("browser-reset", {
+    description: "Close everything, stop the shared browser, wipe the agent home. Next navigation relaunches fresh.",
+    handler: async (_args, ctx) => {
+      try {
+        const root = await resetSession({ profileDir: sessionOpts().profileDir });
+        ctx.ui.notify(`Agent session closed and profile wiped (${root}). Next navigation starts fresh.`, "info");
+      } catch (err) {
+        ctx.ui.notify(`/browser-reset failed: ${err instanceof Error ? err.message : String(err)}`, "error");
+      }
     },
   });
 }

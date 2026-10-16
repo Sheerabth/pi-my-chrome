@@ -1,13 +1,12 @@
 /**
  * Manual browsing: observe the page, pick an action id, act. No keys,
  * no model calls — the caller (Pi, a human, a script) decides everything.
- * Execution uses the same {@link CloakBrowserAdapter} as the session,
+ * Execution uses the same {@link AgentBrowserAdapter} as the session,
  * so freshness + occlusion checks are identical.
  */
 
-import { CloakBrowserAdapter } from "./cloakAdapter.js";
-import type { LaunchOpts } from "./cloakAdapter.js";
-import { ensureEnv } from "./config.js";
+import { AgentBrowserAdapter } from "./browserAdapter.js";
+import type { LaunchOpts } from "./browserAdapter.js";
 import type { PageAction, PageSnapshot } from "./types.js";
 
 const KIND_OP: Record<string, string> = { click: "CLICK", fill: "TYPE_TEXT", select: "SELECT", upload: "UPLOAD" };
@@ -26,7 +25,8 @@ export function formatPage(page: PageSnapshot): string {
 }
 
 /**
- * CloakBrowser on your profile copy. No keys, no model calls.
+ * Patchright stealth browser on the persistent agent profile. No keys,
+ * no model calls — log in once and the session persists across runs.
  *
  * ```ts
  * const browser = await SimpleBrowser.create(url);
@@ -42,11 +42,10 @@ export function formatPage(page: PageSnapshot): string {
 export class SimpleBrowser {
   private page: PageSnapshot | null = null;
 
-  private constructor(private browser: CloakBrowserAdapter) {}
+  private constructor(private browser: AgentBrowserAdapter) {}
 
   static async create(url: string, opts: LaunchOpts = {}): Promise<SimpleBrowser> {
-    ensureEnv();
-    return new SimpleBrowser(await CloakBrowserAdapter.create(url, opts));
+    return new SimpleBrowser(await AgentBrowserAdapter.create(url, opts));
   }
 
   async observe(screenshot = false): Promise<PageSnapshot> {
@@ -82,7 +81,7 @@ export class SimpleBrowser {
     return this.browser.screenshot(fullPage);
   }
 
-  /** Run a code-owned read script (see CloakBrowserAdapter.evaluate). */
+  /** Run a code-owned read script (see AgentBrowserAdapter.evaluate). */
   async evaluate<T>(expression: string): Promise<T> {
     return this.browser.evaluate<T>(expression);
   }
@@ -93,10 +92,6 @@ export class SimpleBrowser {
 
   tabUrls(): string[] {
     return this.browser.tabUrls();
-  }
-
-  async closeOtherTabs(): Promise<void> {
-    await this.browser.closeOtherTabs();
   }
 
   async back(): Promise<void> {

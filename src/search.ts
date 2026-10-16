@@ -11,7 +11,7 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { CloakBrowserAdapter } from "./cloakAdapter.js";
+import type { AgentBrowserAdapter } from "./browserAdapter.js";
 import { runInTab } from "./session.js";
 import type { PageSnapshot } from "./types.js";
 
@@ -318,7 +318,7 @@ async function respectRateLimit(): Promise<void> {
  */
 export async function searchMany(
   queries: string[],
-  opts: { engine?: SearchEngine; maxResults?: number; headless?: boolean; profileDir?: string; depth?: number } = {},
+  opts: { engine?: SearchEngine; maxResults?: number; headless?: boolean; profileDir?: string; proxy?: string; depth?: number } = {},
 ): Promise<{ results: SearchResult[]; errors: { query: string; error: string }[] }> {
   const results: SearchResult[] = [];
   const errors: { query: string; error: string }[] = [];
@@ -341,7 +341,7 @@ export async function searchMany(
 
 export async function search(
   query: string,
-  opts: { engine?: SearchEngine; maxResults?: number; headless?: boolean; profileDir?: string; depth?: number } = {},
+  opts: { engine?: SearchEngine; maxResults?: number; headless?: boolean; profileDir?: string; proxy?: string; depth?: number } = {},
 ): Promise<SearchResult[]> {
   // One engine, as asked. No silent fallback: an empty result or a thrown
   // error lets the caller (Pi) decide to retry, rephrase, or switch engines.
@@ -351,7 +351,7 @@ export async function search(
 async function runEngine(
   query: string,
   engine: SearchEngine,
-  opts: { maxResults?: number; headless?: boolean; profileDir?: string; depth?: number },
+  opts: { maxResults?: number; headless?: boolean; profileDir?: string; proxy?: string; depth?: number },
 ): Promise<SearchResult[]> {
   await respectRateLimit();
   const def = ENGINES[engine];
@@ -428,7 +428,7 @@ async function runEngine(
       return true;
     };
     let guard = 0;
-    const debug = !!process.env.PI_MY_CHROME_DEBUG;
+    const debug = !!process.env.PI_SHADOW_DEBUG;
     while (results.length < maxResults && guard++ < maxResults * 3 + 5) {
       const batch = (await b.evaluate(RESULTS_JS)) as { title: string; href: string; snippet: string }[];
       if (debug) console.log(`[search] iter=${guard} batch=${batch.length} have=${results.length}`);
@@ -482,15 +482,18 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 /** Click an opaque redirect link (matched by title), read where it lands.
  *  Handles same-tab navigation and target=_blank popups. Restores tabs. */
 async function resolveByClick(
-  browser: CloakBrowserAdapter,
+  browser: AgentBrowserAdapter,
   searchUrl: string,
   title: string,
   homeHost: string,
   siteSearch = false,
 ): Promise<string | null> {
   const norm = title.trim().replace(/\s+/g, " ");
-  const debug = !!process.env.PI_MY_CHROME_DEBUG;
+  const debug = !!process.env.PI_SHADOW_DEBUG;
   const before = browser.currentUrl();
+  // Snapshot THIS window's tabs before clicking: restore closes only tabs
+  // that appeared in-window after the click (never pre-existing tabs,
+  // never another agent's window). Redirecting popups still get cleaned.
   const clicked = await browser.evaluate<string>(
     `((t) => { const a = [...document.querySelectorAll('a[href]')]` +
       `.find((x) => (x.innerText || '').trim().replace(/\\s+/g, ' ') === t);` +
@@ -502,7 +505,8 @@ async function resolveByClick(
   }
   // Either the tab navigated or a popup opened — poll for both.
   // Only URLs unseen before the click count (stale tabs must not match).
-  const known = new Set([before, ...browser.tabUrls()]);
+  const knownBefore = await browser.tabUrlsInWindow().catch(() => browser.tabUrls());
+  const known = new Set([before, ...knownBefore]);
   let landed = "";
   for (let i = 0; i < 12; i++) {
     await sleep(400);
@@ -512,8 +516,8 @@ async function resolveByClick(
         landed = current;
         break;
       }
-      const popup = browser
-        .tabUrls()
+      const urls = await browser.tabUrlsInWindow().catch(() => browser.tabUrls());
+      const popup = urls
         .find((u) => u && !u.startsWith("about:") && !known.has(u) && !isJunkResult(u, homeHost, siteSearch));
       if (popup) {
         landed = popup;
@@ -524,9 +528,12 @@ async function resolveByClick(
     }
   }
   try {
-    // Restore: back out of same-tab navs, close popup tabs.
+    // Restore: back out of same-tab navs, close only the popup we opened
+    // in THIS window (never pre-existing tabs, never another agent's
+    // window — closeTabWithUrl is window-scoped). A click can both
+    // navigate and pop, so sweep the landed popup even after backing out.
     if (browser.currentUrl() !== before) await browser.back();
-    await browser.closeOtherTabs();
+    if (landed && landed !== before) await browser.closeTabWithUrl(landed);
     for (let i = 0; i < 10; i++) {
       const n = await browser.evaluate<number>("(() => document.querySelectorAll('a[href]').length)()");
       if (n > 10) break;

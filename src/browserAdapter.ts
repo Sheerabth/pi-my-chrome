@@ -1,20 +1,23 @@
 /**
- * CloakBrowser backend behind the agent's Browser interface.
+ * Patchright backend behind the agent's Browser interface.
  *
  * The agent loop only uses 4 methods: observe / fresh / act / close.
- * Implemented on CloakBrowser (stealth + persistent profile) while reusing
+ * Implemented on Patchright's stealth Chromium (open-source Playwright fork
+ * with fingerprint patches) over a persistent agent profile, while reusing
  * the vendored upstream snapshot.js verbatim — no fork of the DOM reader.
  */
 
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { Worker } from "node:worker_threads";
 import { fileURLToPath } from "node:url";
-import { launchPersistentContext } from "cloakbrowser";
-import type { BrowserContext, ElementHandle, Frame, Page } from "playwright-core";
-import { ensureProfileCopy, acquireProfileLock, agentRoot } from "./profile.js";
+import { chromium } from "patchright";
+import type { BrowserContext, CDPSession, Download, ElementHandle, Frame, Page } from "patchright";
+
+import { ensureDaemon } from "./daemon.js";
+import { agentRoot } from "./profile.js";
 import type { PageAction, PageSnapshot } from "./types.js";
 
 export class StalePage extends Error {
@@ -181,25 +184,42 @@ function matchInWorker(
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-/** Process-wide mutex: cheap fast path before the cross-process file lock. */
-class Mutex {
-  private tail: Promise<void> = Promise.resolve();
-  async acquire(): Promise<() => void> {
-    let release!: () => void;
-    const prev = this.tail;
-    this.tail = new Promise<void>((r) => {
-      release = r;
-    });
-    await prev;
-    return release;
+/** Split a proxy URL into Playwright's {server, username, password} shape. */
+function parseProxy(raw: string): { server: string; username?: string; password?: string } {
+  try {
+    const u = new URL(raw);
+    const out: { server: string; username?: string; password?: string } = {
+      server: `${u.protocol}//${u.host}`,
+    };
+    if (u.username) out.username = decodeURIComponent(u.username);
+    if (u.password) out.password = decodeURIComponent(u.password);
+    return out;
+  } catch {
+    return { server: raw };
   }
 }
 
-const PROFILE_LOCK = new Mutex();
+export const BIRTH_URLS = new Set([
+  "about:blank",
+  "chrome://newtab/",
+  "chrome://new-tab-page/",
+  "chrome-search://local-ntp/local-ntp.html",
+]);
+
+/** In-page flag marking a birth tab already owned by an agent window.
+ *  Prevents two sequential AgentBrowserAdapter.create() calls from
+ *  adopting the same initial birth window. */
+const CLAIM_JS = "window.__piShadowClaimed === true";
+const CLAIM_SET_JS = "window.__piShadowClaimed = true";
+/** Same-process guard: targetIds claimed as birth windows by a concurrent
+ *  create() in this process (CDP + page-flag checks race across processes). */
+const claimedBirthTargets = new Set<string>();
 
 export interface LaunchOpts {
+  /** Engine home: the shared browser lives here (one engine per path).
+   *  The first starter's headless/proxy config wins; later mismatches
+   *  fail loudly (below) so traffic never goes somewhere unconfigured. */
   userDataDir?: string;
-  realProfile?: string;
   headless?: boolean;
   proxy?: string;
   locale?: string;
@@ -209,8 +229,7 @@ export interface LaunchOpts {
   permissions?: string[];
 }
 
-export class CloakBrowserAdapter {
-  private releaseLocks: (() => void) | null = null;
+export class AgentBrowserAdapter {
   private closed = false;
   /** Frames from the last observe, aligned with action `frame` indices. */
   private frames: Frame[] = [];
@@ -219,64 +238,398 @@ export class CloakBrowserAdapter {
   private downloads: { name: string; path: string; url: string }[] = [];
   private failedRequests: { url: string; status: number }[] = [];
   private diagnosed = new Set<Page>();
+  /** This agent's OS window on the shared engine (CDP windowId). Every tab
+   *  op is scoped to pages in this window — never another agent's. */
+  private windowId: number | null = null;
+  private browserSession: CDPSession | null = null;
+  private downloadListener: ((download: Download) => void) | null = null;
+  /** Sync best-effort membership for window tabs created through this
+   *  adapter (adopted + opened in-window). Async windowPages() via CDP is
+   *  authoritative; this set lets the sync tabUrls() stay window-scoped. */
+  private owned = new Set<Page>();
 
   private constructor(
     private ctx: BrowserContext,
     private page: Page,
   ) {}
 
-  static async create(url: string, opts: LaunchOpts = {}): Promise<CloakBrowserAdapter> {
-    const releaseMutex = await PROFILE_LOCK.acquire();
-    let releaseFile: (() => void) | null = null;
-    const releaseAll = () => {
-      releaseFile?.();
-      releaseFile = null;
-      releaseMutex();
-    };
-    try {
-      const root = agentRoot(opts.userDataDir);
-      releaseFile = await acquireProfileLock(root);
-      ensureProfileCopy({ root, real: opts.realProfile });
-      const headless = opts.headless ?? (process.env.AGENTSEARCH_HEADLESS ?? "1") !== "0";
-      const ctx = await launchPersistentContext({
-        userDataDir: root,
-        headless,
-        humanize: true,
-        proxy: opts.proxy,
-        locale: opts.locale,
-        timezone: opts.timezone,
-        userAgent: opts.userAgent,
-        contextOptions: {
-          acceptDownloads: true,
-          ...(opts.geolocation ? { geolocation: opts.geolocation } : {}),
-          ...(opts.permissions ? { permissions: opts.permissions } : {}),
-        },
-      });
-      // Deterministic single-tab start: the persistent profile may restore
-      // session tabs from previous runs — never inherit them.
-      for (const p of ctx.pages()) {
+  static async create(url: string, opts: LaunchOpts = {}): Promise<AgentBrowserAdapter> {
+    // One shared engine per profileDir: attach over CDP to its default
+    // context (contexts[0]) and own ONE window (CDP windowId) on it.
+    // Never launch, never touch another agent's window/tabs.
+    let proxyServer: string | undefined;
+    if (opts.proxy) {
+      const parsed = parseProxy(opts.proxy);
+      if (parsed.username || parsed.password) {
+        throw new Error("Authenticated proxies are not supported on the shared browser — use an unauthenticated proxy URL.");
+      }
+      proxyServer = parsed.server;
+    }
+    const root = agentRoot(opts.userDataDir);
+    const { cdpUrl, headless: daemonHeadless, proxyServer: daemonProxy } = await ensureDaemon({
+      headless: opts.headless ?? false,
+      root,
+      ...(proxyServer ? { proxyServer } : {}),
+    });
+    if (opts.headless !== undefined && opts.headless !== daemonHeadless) {
+      throw new Error(
+        opts.headless
+          ? "Shared browser is headed (first starter set headed) — /browser-shutdown it and retry for a headless one."
+          : "Shared browser is headless (first starter set headless) — /browser-shutdown it and retry for a visible one.",
+      );
+    }
+    if (opts.proxy && proxyServer !== daemonProxy) {
+      throw new Error(
+        `Shared browser runs ${daemonProxy ? "with a different proxy" : "without a proxy"} — /browser-shutdown it and retry for ${proxyServer}.`,
+      );
+    }
+    // connectOverCDP has no built-in timeout: a wedged-but-listening daemon
+    // would hang the caller (and the whole TUI awaiting the command) forever.
+    const browser = await Promise.race([
+      chromium.connectOverCDP(cdpUrl),
+      new Promise<never>((_, reject) =>
+        setTimeout(
+          () => reject(new Error(`CDP connect timed out after 30s (${cdpUrl}) — daemon is wedged; /browser-shutdown it and retry.`)),
+          30_000,
+        ),
+      ),
+    ]);
+    const contexts = browser.contexts();
+    const ctx = contexts[0] ?? (await browser.newContext());
+    const seed = ctx.pages()[0] ?? (await ctx.newPage());
+    const adapter = new AgentBrowserAdapter(ctx, seed);
+    // Browser-level CDP drives window management (getWindowForTarget /
+    // createTarget). One session per adapter; detached on close().
+    adapter.browserSession = await browser.newBrowserCDPSession();
+    await adapter.claimWindow(url);
+    adapter.watchDownloads(join(root, "downloads"));
+    // Listeners before first navigation: early console errors and
+    // failed responses would otherwise fire before anyone listens.
+    adapter.watchDiagnostics();
+    if (url && !BIRTH_URLS.has(url)) {
+      await adapter.page.goto(url);
+      await adapter.page.waitForLoadState("domcontentloaded");
+    } else if (url) {
+      // Birth URL: stay on the owned blank tab (no extra navigation).
+      try {
+        if (!BIRTH_URLS.has(adapter.page.url())) await adapter.page.goto("about:blank");
+      } catch {
+        // Best-effort.
+      }
+    }
+    return adapter;
+  }
+
+  /** Claim this adapter's ONE window on the shared engine.
+   *  Cold start: adopt the daemon's single unclaimed birth tab/window so no
+   *  extra unused birth window is left behind. Otherwise open a brand-new
+   *  full-UI browser window via CDP Target.createTarget(newWindow:true)
+   *  (never a chromeless popup) and operate strictly inside it. */
+  private async claimWindow(_url: string): Promise<void> {
+    const session = this.browserSession;
+    if (!session) throw new Error("Browser session not established.");
+    const pages = this.ctx.pages();
+    // Resolve window per page (best-effort each; dead tabs skip).
+    const entries: { page: Page; targetId: string | null; windowId: number | null; birth: boolean; claimed: boolean }[] = [];
+    for (const p of pages) {
+      const targetId = await this.targetIdOf(p);
+      let windowId: number | null = null;
+      if (targetId) {
         try {
-          await p.close();
+          const r = (await session.send("Browser.getWindowForTarget", { targetId })) as { windowId?: number };
+          windowId = typeof r.windowId === "number" ? r.windowId : null;
         } catch {
-          // Best-effort.
+          windowId = null;
         }
       }
-      const page = await ctx.newPage();
-      const adapter = new CloakBrowserAdapter(ctx, page);
-      adapter.releaseLocks = releaseAll;
-      adapter.mainPage = page;
-      adapter.watchDownloads(join(root, "downloads"));
-      // Listeners before first navigation: early console errors and
-      // failed responses would otherwise fire before anyone listens.
-      adapter.watchDiagnostics();
-      await page.goto(url);
-      await page.waitForLoadState("domcontentloaded");
-      releaseMutex();
-      return adapter;
-    } catch (err) {
-      releaseAll();
-      throw err;
+      let u = "";
+      try {
+        u = p.url();
+      } catch {
+        continue;
+      }
+      let claimed = true;
+      try {
+        claimed = (await p.evaluate(CLAIM_JS)) === true;
+      } catch {
+        claimed = true;
+      }
+      if (targetId && claimedBirthTargets.has(targetId)) claimed = true;
+      entries.push({ page: p, targetId, windowId, birth: BIRTH_URLS.has(u), claimed });
     }
+    const byWindow = new Map<number, typeof entries>();
+    for (const e of entries) {
+      if (e.windowId === null) continue;
+      const list = byWindow.get(e.windowId) ?? [];
+      list.push(e);
+      byWindow.set(e.windowId, list);
+    }
+    // Adoptable: exactly one window on the engine, every tab a birth URL,
+    // none claimed by another agent. First agent takes it; everyone after
+    // opens their own window.
+    let adopt: (typeof entries)[number] | null = null;
+    if (byWindow.size === 1) {
+      const [[, list]] = [...byWindow.entries()];
+      if (list.length > 0 && list.every((e) => e.birth && !e.claimed)) adopt = list[0];
+    }
+    if (adopt && adopt.windowId !== null) {
+      this.windowId = adopt.windowId;
+      this.page = adopt.page;
+      this.mainPage = adopt.page;
+      this.owned.add(adopt.page);
+      try {
+        await adopt.page.evaluate(CLAIM_SET_JS);
+      } catch {
+        // Best-effort.
+      }
+      if (adopt.targetId) claimedBirthTargets.add(adopt.targetId);
+      await this.focusWindow();
+      return;
+    }
+    // Open our own full-UI window. Verified headed: newWindow:true creates
+    // a normal browser window (distinct windowId), not a popup.
+    const beforeIds = new Set(entries.map((e) => e.targetId).filter(Boolean) as string[]);
+    let newTargetId = "";
+    try {
+      const res = (await session.send("Target.createTarget", { url: "about:blank", newWindow: true })) as { targetId?: string };
+      newTargetId = res.targetId ?? "";
+    } catch (err) {
+      throw new Error(`Could not open a browser window: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    if (!newTargetId) throw new Error("Could not open a browser window: empty targetId.");
+    let newWindowId: number | null = null;
+    try {
+      const r = (await session.send("Browser.getWindowForTarget", { targetId: newTargetId })) as { windowId?: number };
+      newWindowId = typeof r.windowId === "number" ? r.windowId : null;
+    } catch {
+      newWindowId = null;
+    }
+    if (newWindowId === null) throw new Error("Could not determine the new browser window id.");
+    // Find the Page object for the new target (poll: Playwright learns it async).
+    let owned: Page | null = null;
+    const deadline = Date.now() + 10_000;
+    for (;;) {
+      for (const p of this.ctx.pages()) {
+        const tid = await this.targetIdOf(p);
+        if (tid === newTargetId) {
+          owned = p;
+          break;
+        }
+        if (tid && !beforeIds.has(tid)) {
+          // Fallback match by fresh windowId when targetIds are opaque.
+          try {
+            const r = (await session.send("Browser.getWindowForTarget", { targetId: tid })) as { windowId?: number };
+            if (r.windowId === newWindowId) {
+              owned = p;
+              break;
+            }
+          } catch {
+            // Keep looking.
+          }
+        }
+      }
+      if (owned || Date.now() > deadline) break;
+      await sleep(150);
+    }
+    if (!owned) throw new Error("New browser window opened but its tab never appeared.");
+    this.windowId = newWindowId;
+    this.page = owned;
+    this.mainPage = owned;
+    this.owned.add(owned);
+    try {
+      await owned.evaluate(CLAIM_SET_JS);
+    } catch {
+      // Best-effort.
+    }
+    claimedBirthTargets.add(newTargetId);
+    // Fresh-daemon leftover: if the engine had exactly one unclaimed birth
+    // tab and we opened a new window instead of adopting (concurrent
+    // create race), close that orphan so cold start leaves no unused birth
+    // window. Never touches claimed or non-birth tabs.
+    try {
+      if (entries.length === 1 && entries[0].birth && !entries[0].claimed) {
+        await entries[0].page.close().catch(() => undefined);
+      }
+    } catch {
+      // Best-effort.
+    }
+    await this.focusWindow();
+  }
+
+  /** Resolve the CDP targetId for a page (internal id first, CDP fallback). */
+  private async targetIdOf(page: Page): Promise<string | null> {
+    try {
+      const t =
+        (page as unknown as { _delegate?: { _target?: { _targetId?: string } } })._delegate?._target?._targetId ??
+        (page as unknown as { _targetId?: string })._targetId;
+      if (typeof t === "string" && t) return t;
+    } catch {
+      // Fall through to CDP.
+    }
+    try {
+      const s = await this.ctx.newCDPSession(page);
+      try {
+        const info = (await s.send("Target.getTargetInfo", {})) as { targetInfo?: { targetId?: string }; targetId?: string };
+        return info.targetInfo?.targetId ?? info.targetId ?? null;
+      } finally {
+        await s.detach().catch(() => undefined);
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  /** Pages strictly in THIS adapter's window (authoritative via CDP). */
+  private async windowPages(): Promise<Page[]> {
+    if (this.windowId === null) return [...this.ctx.pages()];
+    const session = this.browserSession;
+    const out: Page[] = [];
+    for (const p of this.ctx.pages()) {
+      try {
+        const tid = await this.targetIdOf(p);
+        if (!tid || !session) continue;
+        const r = (await session.send("Browser.getWindowForTarget", { targetId: tid })) as { windowId?: number };
+        if (r.windowId === this.windowId) out.push(p);
+      } catch {
+        // Dead tab — skip.
+      }
+    }
+    return out;
+  }
+
+  /** Open a tab guaranteed inside this window (window.open from an owned
+   *  page stays in-window by construction; verified via getWindowForTarget
+   *  with a CDP Target.createTarget(windowId) fallback). */
+  private async newPageInWindow(url = "about:blank"): Promise<Page> {
+    if (this.windowId === null) {
+      const p = await this.ctx.newPage();
+      return p;
+    }
+    const before = new Set(this.ctx.pages());
+    try {
+      await this.page.evaluate((u: string) => {
+        window.open(u, "_blank");
+      }, url);
+    } catch {
+      // evaluate failed (dead page?) — fall through to CDP.
+    }
+    const session = this.browserSession;
+    const deadline = Date.now() + 10_000;
+    for (;;) {
+      for (const p of this.ctx.pages()) {
+        if (before.has(p)) continue;
+        try {
+          const tid = await this.targetIdOf(p);
+          if (tid && session) {
+            const r = (await session.send("Browser.getWindowForTarget", { targetId: tid })) as { windowId?: number };
+            if (r.windowId === this.windowId) {
+              this.owned.add(p);
+              return p;
+            }
+          } else if (!tid) {
+            this.owned.add(p);
+            return p;
+          }
+        } catch {
+          // Keep looking.
+        }
+      }
+      if (Date.now() > deadline) break;
+      await sleep(150);
+    }
+    // Fallback: CDP createTarget aimed at our window (param name varies by
+    // build: try windowId, then window), verified the same way.
+    if (session) {
+      const sendRaw = session.send as unknown as (method: string, params?: unknown) => Promise<{ targetId?: string }>;
+      for (const params of [{ url, windowId: this.windowId }, { url, window: this.windowId }]) {
+        try {
+          const res = await sendRaw("Target.createTarget", params);
+          if (!res.targetId) continue;
+          const inner = Date.now() + 10_000;
+          for (;;) {
+            for (const p of this.ctx.pages()) {
+              if (before.has(p)) continue;
+              try {
+                if ((await this.targetIdOf(p)) === res.targetId) {
+                  this.owned.add(p);
+                  return p;
+                }
+              } catch {
+                // Keep looking.
+              }
+            }
+            if (Date.now() > inner) break;
+            await sleep(150);
+          }
+        } catch {
+          // Try the next param shape.
+        }
+      }
+    }
+    // Last resort: plain newPage + verify (window-focus usually lands it
+    // in-window; still verify before returning).
+    const fallback = await this.ctx.newPage();
+    try {
+      if (url && fallback.url() !== url) await fallback.goto(url);
+    } catch {
+      // Best-effort.
+    }
+    this.owned.add(fallback);
+    return fallback;
+  }
+
+  /** Focus this window/tab (best-effort; headless has no front). */
+  private async focusWindow(): Promise<void> {
+    try {
+      await this.page.bringToFront();
+    } catch {
+      // Best-effort.
+    }
+    try {
+      if (this.windowId !== null) {
+        await this.browserSession?.send("Browser.setWindowBounds", {
+          windowId: this.windowId,
+          bounds: { windowState: "normal" },
+        });
+      }
+    } catch {
+      // Best-effort.
+    }
+  }
+
+  /** /browser-open on THIS session's window: focus an existing blank/birth
+   *  tab when one exists, else open one blank tab in-window and focus it.
+   *  Never duplicates blanks, never touches another agent's window. */
+  async openBlankTab(): Promise<string> {
+    const pages = await this.windowPages();
+    // Current operated tab already blank → just focus, no duplicate.
+    try {
+      if (BIRTH_URLS.has(this.page.url())) {
+        await this.focusWindow();
+        return this.page.url();
+      }
+    } catch {
+      // Dead page — fall through to window scan.
+    }
+    for (const p of pages) {
+      if (p === this.page) continue;
+      try {
+        if (BIRTH_URLS.has(p.url())) {
+          this.page = p;
+          this.watchDiagnostics();
+          await this.focusWindow();
+          return p.url();
+        }
+      } catch {
+        // Skip dead tabs.
+      }
+    }
+    const tab = await this.newPageInWindow("about:blank");
+    this.page = tab;
+    if (!this.mainPage || this.mainPage.isClosed()) this.mainPage = tab;
+    this.watchDiagnostics();
+    await this.focusWindow();
+    return tab.url();
   }
 
   async observe(screenshot = false): Promise<PageSnapshot> {
@@ -364,7 +717,7 @@ export class CloakBrowserAdapter {
       try {
         extra = (await frame.evaluate(SHADOW_JS)) as PageAction[];
       } catch (err) {
-        if (process.env.PI_MY_CHROME_DEBUG) {
+        if (process.env.PI_SHADOW_DEBUG) {
           console.log(`[shadow] evaluate failed: ${err instanceof Error ? err.message.slice(0, 120) : String(err)}`);
         }
         continue;
@@ -620,7 +973,7 @@ export class CloakBrowserAdapter {
   }
 
   /** Capture failed requests for breakage diagnosis. Reset per observe.
-   *  NOTE: console-error capture was tried and removed — this CloakBrowser
+   *  NOTE: console-error capture was tried and removed — this Chromium
    *  build does not deliver CDP console events (verified: load-time throws,
    *  explicit console.error, post-load evaluates all silent). Network
    *  responses arrive fine, so failures surface here instead. */
@@ -640,11 +993,33 @@ export class CloakBrowserAdapter {
     });
   }
 
-  /** Track downloads: save into the profile dir, remember name/path/url. */
+  /** Track downloads: save into the profile dir, remember name/path/url.
+   *  Only records downloads triggered by pages in this adapter's window;
+   *  the listener is removed on close() so the shared contexts[0] never
+   *  accumulates dead listeners. */
   private watchDownloads(dir: string): void {
-    this.ctx.on("download", (download) => {
+    try {
+      mkdirSync(dir, { recursive: true });
+    } catch {
+      // Best-effort (saveAs will surface real failures).
+    }
+    this.downloadListener = (download: Download) => {
       void (async () => {
         try {
+          // Attribute to this window only: ignore other agents' downloads
+          // on the shared context.
+          const src = download.page();
+          if (src && this.windowId !== null && this.browserSession) {
+            try {
+              const tid = await this.targetIdOf(src);
+              if (tid) {
+                const r = (await this.browserSession.send("Browser.getWindowForTarget", { targetId: tid })) as { windowId?: number };
+                if (r.windowId !== this.windowId) return;
+              }
+            } catch {
+              // Attribute-check failed — record anyway rather than lose it.
+            }
+          }
           const safe = download.suggestedFilename().replace(/[^\w.\-]+/g, "_").slice(0, 120) || "download";
           const path = join(dir, `${Date.now()}-${safe}`);
           await download.saveAs(path);
@@ -653,7 +1028,8 @@ export class CloakBrowserAdapter {
           // Best-effort.
         }
       })();
-    });
+    };
+    this.ctx.on("download", this.downloadListener);
   }
 
   downloadList(): { name: string; path: string; url: string }[] {
@@ -672,10 +1048,10 @@ export class CloakBrowserAdapter {
     return out;
   }
 
-  /** Operated tabs: index + url + title for every open page. */
+  /** Operated tabs: index + url + title for tabs in THIS window only. */
   async tabList(): Promise<{ index: number; url: string; title: string }[]> {
     const out: { index: number; url: string; title: string }[] = [];
-    const pages = this.ctx.pages();
+    const pages = await this.windowPages();
     for (let i = 0; i < pages.length; i++) {
       let url = "";
       let title = "";
@@ -694,9 +1070,9 @@ export class CloakBrowserAdapter {
     return out;
   }
 
-  /** Switch the operated page. Next observe/act uses the new tab. */
+  /** Switch the operated page (this window only). Next observe/act uses it. */
   async switchTo(index: number): Promise<void> {
-    const pages = this.ctx.pages();
+    const pages = await this.windowPages();
     if (!Number.isInteger(index) || index < 0 || index >= pages.length) {
       throw new Error(`No tab ${index} — see browser_tabs for the list.`);
     }
@@ -709,9 +1085,9 @@ export class CloakBrowserAdapter {
     this.watchDiagnostics();
   }
 
-  /** Close one tab (never the last — use close() to end the session). */
+  /** Close one tab in this window (never the last — use close() instead). */
   async closeTab(index: number): Promise<void> {
-    const pages = this.ctx.pages();
+    const pages = await this.windowPages();
     if (!Number.isInteger(index) || index < 0 || index >= pages.length) {
       throw new Error(`No tab ${index} — see browser_tabs for the list.`);
     }
@@ -720,8 +1096,8 @@ export class CloakBrowserAdapter {
     }
     const target = pages[index];
     await target.close().catch(() => undefined);
-    if (target === this.page) {
-      const rest = this.ctx.pages();
+    if (target === this.page || this.page.isClosed()) {
+      const rest = await this.windowPages();
       if (rest.length > 0) {
         this.page = rest[0];
         try {
@@ -775,9 +1151,11 @@ export class CloakBrowserAdapter {
    * second launch would queue on the file lock, not run in parallel.
    * fn must use adapter methods directly (never session fns — deadlock).
    */
-  async withTab<R>(url: string, fn: (b: CloakBrowserAdapter) => Promise<R>): Promise<R> {
+  async withTab<R>(url: string, fn: (b: AgentBrowserAdapter) => Promise<R>): Promise<R> {
     const prev = this.page;
-    const tab = await this.ctx.newPage();
+    // Throwaway tab lives in THIS window (keeps mainPage at about:blank so
+    // closing the throwaway never closes the agent's last-tab window).
+    const tab = await this.newPageInWindow("about:blank");
     this.page = tab;
     this.watchDiagnostics();
     try {
@@ -789,28 +1167,77 @@ export class CloakBrowserAdapter {
       await tab.close().catch(() => undefined);
     }
   }
-  /** URLs of every open tab in this context. */
+  /** URLs of open tabs in THIS window only. Sync best-effort: tabs the
+   *  adapter adopted or opened in-window (plus the operated page); prunes
+   *  closed pages. Async tabUrlsInWindow() via CDP is authoritative. */
   tabUrls(): string[] {
-    return this.ctx.pages().map((p) => {
+    const live = new Set(this.ctx.pages());
+    for (const p of [...this.owned]) {
       try {
-        return p.url();
+        if (!live.has(p) || p.isClosed()) this.owned.delete(p);
       } catch {
-        return "";
+        this.owned.delete(p);
       }
-    });
+    }
+    if (this.windowId === null || this.owned.size === 0) {
+      return this.ctx.pages().map((p) => {
+        try {
+          return p.url();
+        } catch {
+          return "";
+        }
+      });
+    }
+    const include = new Set(this.owned);
+    include.add(this.page);
+    if (this.mainPage) include.add(this.mainPage);
+    return this.ctx.pages()
+      .filter((p) => include.has(p))
+      .map((p) => {
+        try {
+          return p.url();
+        } catch {
+          return "";
+        }
+      });
   }
 
-  /** Close every tab except the main one and the operated one (popup cleanup). */
-  async closeOtherTabs(): Promise<void> {
-    for (const p of this.ctx.pages()) {
-      if (p !== this.page && p !== this.mainPage) {
+  /** Async window-scoped URLs (authoritative via CDP). Prefer over tabUrls
+   *  when an await is affordable. */
+  async tabUrlsInWindow(): Promise<string[]> {
+    const out: string[] = [];
+    for (const p of await this.windowPages()) {
+      try {
+        out.push(p.url());
+      } catch {
+        out.push("");
+      }
+    }
+    return out;
+  }
+
+  /** Close one tab by exact URL in THIS window only (popup cleanup).
+   *  Never touches the operated or main tab. Returns true when closed. */
+  async closeTabWithUrl(url: string): Promise<boolean> {
+    if (!url) return false;
+    for (const p of await this.windowPages()) {
+      if (p === this.page || p === this.mainPage) continue;
+      let u = "";
+      try {
+        u = p.url();
+      } catch {
+        continue;
+      }
+      if (u === url) {
         try {
           await p.close();
         } catch {
           // Best-effort.
         }
+        return true;
       }
     }
+    return false;
   }
 
   async back(): Promise<void> {
@@ -829,14 +1256,38 @@ export class CloakBrowserAdapter {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    // This agent's window only: close every tab in our windowId (closing
+    // the last tab closes our window cleanly). Shared context, browser,
+    // and every other agent's window stay exactly as they were. Never
+    // browser.close() — that handle is shared with the daemon.
     try {
-      // Bounded: a wedged browser must not hang callers forever.
-      await Promise.race([this.ctx.close(), new Promise((r) => setTimeout(r, 20000))]);
+      if (this.downloadListener) this.ctx.off("download", this.downloadListener);
     } catch {
       // Best-effort.
-    } finally {
-      this.releaseLocks?.();
-      this.releaseLocks = null;
     }
+    this.downloadListener = null;
+    try {
+      const owned = await this.windowPages();
+      for (const p of owned) {
+        try {
+          await Promise.race([p.close(), new Promise((r) => setTimeout(r, 5000))]);
+        } catch {
+          // Best-effort per tab.
+        }
+      }
+    } catch {
+      // Best-effort.
+    }
+    this.mainPage = null;
+    this.owned.clear();
+    try {
+      await this.browserSession?.detach().catch(() => undefined);
+    } catch {
+      // Best-effort.
+    }
+    this.browserSession = null;
+    // Drop our CDP connection without stopping the shared browser.
+    // (browser.close() over connectOverCDP would kill the daemon's
+    // browser — never call it here.)
   }
 }

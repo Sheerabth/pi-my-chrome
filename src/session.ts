@@ -2,29 +2,52 @@
  * One persistent browser session per process.
  *
  * Pi navigates step by step across many tool calls; launching a browser per
- * call (~2s + profile copy each) would be absurd. The session opens lazily
+ * call (~2s each) would be absurd. The session opens lazily
  * on first use, serializes concurrent operations (tool calls in one message
  * run in parallel; Playwright must not interleave acts), and closes on
  * `closeSession()` — or stays warm until the process ends.
  *
  * Options on the first call win; later calls reuse the open session.
- * The profile lock still applies underneath: a second *process* queues.
+ * Each process gets its own context on the shared daemon, so concurrent
+ * agents coexist — per-process ops still serialize here for safety.
  */
 
-import { CloakBrowserAdapter } from "./cloakAdapter.js";
-import type { LaunchOpts } from "./cloakAdapter.js";
-import { ensureEnv } from "./config.js";
-import { wipeProfileCopy } from "./profile.js";
+import { AgentBrowserAdapter } from "./browserAdapter.js";
+import type { LaunchOpts } from "./browserAdapter.js";
+import { daemonStatus, shutdownDaemon } from "./daemon.js";
+import { agentRoot, wipeProfileCopy } from "./profile.js";
 import type { PageSnapshot } from "./types.js";
 
 export interface SessionOpts extends Omit<LaunchOpts, "userDataDir"> {
   profileDir?: string;
 }
-// NOTE: options apply at session creation (first call wins). Later calls with
-// different opts reuse the open session — use browser_reset for a clean slate.
+// NOTE: per-call opts merge over configureSession() defaults. When the
+// effective engine (profileDir/proxy/headless) differs from the live
+// session, the old session window closes and a new one binds to the new
+// engine — no /browser-reset needed for config switches.
 
-let session: CloakBrowserAdapter | null = null;
+let session: AgentBrowserAdapter | null = null;
 let inFlight: Promise<void> = Promise.resolve();
+
+/** In-memory session defaults (set via configureSession, e.g. from Pi
+ *  settings + /browser-config). Merged under per-call opts in
+ *  ensureSession, so lazy creation on ANY tool uses the active config. */
+let defaultOpts: SessionOpts = {};
+/** Engine the live session is bound to (resolved profileDir + proxy +
+ *  headless). A change closes the old session window and rebinds. */
+let activeRoot: string | null = null;
+let activeProxy: string | undefined = undefined;
+let activeHeadless: boolean | undefined = undefined;
+
+/** Set/merge the session-wide defaults. Next ensureSession uses them. */
+export function configureSession(opts: SessionOpts): void {
+  defaultOpts = { ...defaultOpts, ...opts };
+}
+
+/** Effective opts for a call: per-call opts win over session defaults. */
+function mergedOpts(opts: SessionOpts = {}): SessionOpts {
+  return { ...defaultOpts, ...opts };
+}
 
 /** Run fn exclusively (no two adapter operations interleave).
  *  On crashed-browser errors, drop the dead session and run once more
@@ -67,6 +90,9 @@ async function exclusive<T>(fn: () => Promise<T>): Promise<T> {
         // Best-effort.
       }
       session = null;
+      activeRoot = null;
+      activeProxy = undefined;
+      activeHeadless = undefined;
       throw err;
     }
     if (await reviveIfDead(err)) return runOnce();
@@ -74,36 +100,98 @@ async function exclusive<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
-async function ensureSession(url?: string, opts: SessionOpts = {}): Promise<CloakBrowserAdapter> {
-  ensureEnv();
+async function ensureSession(url?: string, opts: SessionOpts = {}): Promise<AgentBrowserAdapter> {
+  const m = mergedOpts(opts);
+  // Engine rebinding: only an EXPLICITLY requested engine key (per-call
+  // opts first, else session defaults) that differs from the live session
+  // rebinds. A call with no engine keys reuses the live session as-is —
+  // so tabList()/read() with no args never yank the session off the engine
+  // an earlier call configured (Test A: openBlankTab(profileDir) then
+  // bare tabList()).
+  const wantRoot = opts.profileDir ?? defaultOpts.profileDir;
+  const wantProxy = opts.proxy ?? defaultOpts.proxy;
+  const wantHeadless = opts.headless ?? defaultOpts.headless;
+  if (session && activeRoot !== null) {
+    const rebind =
+      (wantRoot !== undefined && wantRoot !== activeRoot) ||
+      (wantProxy !== undefined && wantProxy !== (activeProxy ?? undefined)) ||
+      (wantHeadless !== undefined && wantHeadless !== activeHeadless);
+    if (rebind) {
+      try {
+        await session.close();
+      } catch {
+        // Best-effort.
+      }
+      session = null;
+    }
+  }
   if (!session) {
-    session = await CloakBrowserAdapter.create(url ?? "about:blank", {
-      userDataDir: opts.profileDir,
-      realProfile: opts.realProfile,
-      headless: opts.headless,
-      proxy: opts.proxy,
-      locale: opts.locale,
-      timezone: opts.timezone,
-      userAgent: opts.userAgent,
-      geolocation: opts.geolocation,
-      permissions: opts.permissions,
+    const root = m.profileDir ?? agentRoot();
+    session = await AgentBrowserAdapter.create(url ?? "about:blank", {
+      userDataDir: m.profileDir,
+      headless: m.headless,
+      proxy: m.proxy,
+      locale: m.locale,
+      timezone: m.timezone,
+      userAgent: m.userAgent,
+      geolocation: m.geolocation,
+      permissions: m.permissions,
     });
+    activeRoot = root;
+    activeProxy = m.proxy ?? undefined;
+    // Normalized: daemon default is headed (false), so undefined === false.
+    activeHeadless = m.headless ?? false;
   } else if (url) {
+    // navigate() on a session whose main tab is still an untouched
+    // about:blank reuses that tab (adapter.goto navigates the operated
+    // page) — no extra blank tab is left behind.
     await session.goto(url);
   }
   return session;
 }
 
+/** /browser-open in THIS session's window: ensures the session on the
+ *  configured engine (restarting a headless daemon as headed — an
+ *  invisible window serves no manual use), then focuses or opens one
+ *  blank tab in-window. Idempotent: never duplicates blanks, never
+ *  touches another agent's window. */
+export async function openBlankTab(opts: SessionOpts = {}): Promise<string> {
+  return exclusive(async () => {
+    const m = mergedOpts({ headless: false, ...opts });
+    const headless = m.headless ?? false;
+    const root = m.profileDir ?? agentRoot();
+    if (!headless) {
+      const st = daemonStatus(root);
+      if (st && st.headless) {
+        await shutdownDaemon(root).catch(() => undefined);
+        if (session) {
+          try {
+            await session.close();
+          } catch {
+            // Best-effort.
+          }
+          session = null;
+        }
+      }
+    }
+    const browser = await ensureSession(undefined, { ...m, headless });
+    return browser.openBlankTab();
+  });
+}
+
 /** Drop a dead session (crashed browser) so the next call relaunches. */
 async function reviveIfDead(err: unknown): Promise<boolean> {
   const msg = err instanceof Error ? err.message : String(err);
-  if (/closed|crashed|terminated|browser has been closed|Target closed|Connection closed|Protocol error/i.test(msg)) {
+  if (/closed|crashed|terminated|browser has been closed|Target closed|Connection closed|Protocol error|ECONNREFUSED|WebSocket|disconnected/i.test(msg)) {
     try {
       await session?.close();
     } catch {
       // Best-effort.
     }
     session = null;
+    activeRoot = null;
+    activeProxy = undefined;
+    activeHeadless = undefined;
     return true;
   }
   return false;
@@ -261,18 +349,28 @@ export async function closeSession(): Promise<void> {
       await session.close();
       session = null;
     }
+    activeRoot = null;
+    activeProxy = undefined;
+    activeHeadless = undefined;
   });
 }
 
-/** Reset everything: close the session and wipe the throwaway profile copy.
- *  Next navigation starts from a fresh copy of the real profile. */
-export async function resetSession(): Promise<void> {
-  await exclusive(async () => {
+/** Reset everything: close the session, stop the shared daemon, wipe the
+ *  agent home (rendezvous, login store, downloads). Every agent loses its
+ *  browser at once — loud and explicit, user-invoked only. Returns the
+ *  wiped dir; next navigation relaunches fresh (re-login required). */
+export async function resetSession(opts: { profileDir?: string } = {}): Promise<string> {
+  return exclusive(async () => {
     if (session) {
       await session.close();
       session = null;
     }
-    wipeProfileCopy();
+    activeRoot = null;
+    activeProxy = undefined;
+    activeHeadless = undefined;
+    const root = opts.profileDir ?? agentRoot();
+    await shutdownDaemon(root).catch(() => undefined);
+    return wipeProfileCopy(root);
   });
 }
 
@@ -282,14 +380,14 @@ export function hasSession(): boolean {
 }
 
 /**
- * Run fn with a throwaway tab in the session browser (creating the session
- * if needed). One-shots share the browser instead of launching a second
- * instance — Chromium forbids two on one profile dir. fn must use the
- * adapter directly, never session fns (reentrancy deadlock).
+ * Run fn with a throwaway tab in the session's own context (creating the
+ * session if needed). One-shots share the daemon, never the tab: each
+ * process drives its own context, so concurrent agents cannot collide.
+ * fn must use the adapter directly, never session fns (reentrancy deadlock).
  */
 export async function runInTab<T>(
   url: string,
-  fn: (b: CloakBrowserAdapter) => Promise<T>,
+  fn: (b: AgentBrowserAdapter) => Promise<T>,
   opts: SessionOpts = {},
 ): Promise<T> {
   return exclusive(async () => {

@@ -1,11 +1,12 @@
 /** Example: search, open the top result, read it. No keys. */
 
 import { open, search } from "../src/index.js";
+import type { SearchEngine } from "../src/index.js";
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const query = arg(args, "--query") ?? "population of Zurich";
-  const engine = (arg(args, "--engine") ?? "google") as "google" | "bing";
+  const engine = (arg(args, "--engine") ?? "google") as SearchEngine;
 
   const t0 = Date.now();
   const results = await search(query, { engine, maxResults: 5 });

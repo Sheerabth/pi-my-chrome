@@ -1,20 +1,21 @@
-# pi-my-chrome
+# pi-shadow-browser
 
 [![Node 22+](https://img.shields.io/badge/Node-22+-green.svg)](https://nodejs.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**Pi browses websites the way you do — through your real Chrome profile.**
+**Pi browses websites through its own stealth browser — a separate agent identity.**
 
-`pi-my-chrome` is a TypeScript package + native Pi extension. Your Chrome login
-state is snapshotted to a throwaway dir and driven headless through
-[CloakBrowser](https://github.com/CloakHQ/CloakBrowser) stealth Chromium.
-No re-login, no visible window, your open Chrome untouched. No API keys —
+`pi-shadow-browser` is a TypeScript package + native Pi extension. Pi drives a
+persistent agent profile headless through
+[Patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright) (open-source
+stealth Chromium fork, Apache-2.0). Log in once inside the agent browser and
+the session persists — your own Chrome is never touched. No API keys —
 Pi itself is the agent loop; this package is its hands.
 
 ## The whole product: search, open, navigate
 
 ```ts
-import { search, open } from "pi-my-chrome";
+import { search, open } from "pi-shadow-browser";
 
 const hits = await search("population of Zurich", { maxResults: 5 });
 // [{ title, url, engine, snippet? }, …] — no keys, ~5s
@@ -51,8 +52,10 @@ _Postscript: data tools (`browser_search`, `browser_open`, `browser_video_transc
 | `browser_tab_close` | close one tab (never the last) |
 | `browser_back` / `browser_forward` | history navigation + re-observe |
 | `browser_close` | close the session (reopens on next navigate) |
-| `browser_reset` | close session + wipe profile copy (poisoned state, endless walls) |
-| `/chrome-config` | show resolved config (nothing secret exists to leak) |
+| `/browser-reset` | close everything, stop the daemon, wipe the agent home (fresh login required after) |
+| `/browser-config` | show or change config (`/browser-config [key value \| reset [key]]`) |
+| `/browser-open` | open a focused blank tab in the shared window for manual use (log in by hand) |
+| `/browser-shutdown` | stop the shared browser daemon |
 
 _Data tools (`browser_search`, `browser_open`, `browser_video_transcript`) return dual-channel results: readable text for the model plus typed `structuredContent` (declared `outputSchema`) for codemode scripts. No JSON parsing by the model._
 
@@ -65,47 +68,53 @@ npx tsx examples/run.ts --query "population of Zurich" --engine google
 ```
 search(query) → [{title, url}]     direct /search?q= URLs, redirect unwrapping,
                                    click-resolve for opaque links
-open(url)     → {title, text}      one observe on the profile copy
-navigate/act  → PageSnapshot       shared session, serialized ops, freshness-
-                                   checked acts; profile lock queues processes
+open(url)     → {title, text}      one observe on the shared daemon
+navigate/act  → PageSnapshot       per-process session on its own context
+                                   (concurrent agents coexist), serialized
+                                   ops, freshness-checked acts
 ```
 
 | File | Job |
 |---|---|
 | `src/search.ts` | `search()` → structured results; `open()` → page as **markdown** (headings, links, lists; SPA noise stripped) |
-| `src/session.ts` | one persistent session: lazy open, serialized ops, clean close |
-| `src/cloakAdapter.ts` | `observe/fresh/act/back/forward/goto/close` on CloakBrowser — **iframe-aware**: each frame snapshotted (cross-origin included), actions merged into one indexed space with freshness guards per frame |
-| `src/profile.ts` | selective login-state copy → `/tmp/agent-chrome/`, cross-process lock |
+| `src/session.ts` | per-process session on its own daemon context: lazy attach, serialized ops, clean close |
+| `src/daemon.ts` + `src/daemonRunner.mjs` | one shared stealth Chromium (CDP server, rendezvous file, supervised lifecycle) |
+| `src/browserAdapter.ts` | `observe/fresh/act/back/forward/goto/close` on Patchright stealth Chromium — **iframe-aware**: each frame snapshotted (cross-origin included), actions merged into one indexed space with freshness guards per frame |
+| `src/profile.ts` | agent home (`/tmp/agent-chrome/`, 0700): rendezvous, downloads + daemon-singleton lock |
 | `src/simple.ts` | `SimpleBrowser` — manual driving for scripts |
 | `vendor/shadow-supplement.js` | open-shadow-DOM + `[onclick]`/label/file-input controls, shared node identity |
 | `vendor/markdown.js` | dependency-free page-side HTML→Markdown (approach ported from browser-use) |
 | `src/config.ts` | profile dir, headless, locale/timezone/proxy (there are no keys) |
-| `pi-extension/my-chrome.ts` | the Pi tools + `/chrome-config` |
+| `pi-extension/shadow-browser.ts` | the Pi tools + `/browser-config`, `/browser-open`, `/browser-reset`, `/browser-shutdown` |
 
 ## Installation
 
-Prereqs: Node 22+, Google Chrome (logged in).
+Prereqs: Node 22+.
 
 ```bash
 git clone <this-repo>
-cd pi-my-chrome
+cd pi-shadow-browser
 npm install
-pi install ./pi-my-chrome
+npx patchright install chromium   # one-time stealth-browser download
+pi install ./pi-shadow-browser
 ```
 
-CloakBrowser's binary auto-downloads on first launch. No browser extension, no `--remote-debugging-port` setup.
+No browser extension, no `--remote-debugging-port` setup. One visible browser
+shared by you and every agent: run `/browser-open` for a blank tab, sign in
+yourself — credentials never touch the agent — and every session sees the
+same logged-in window (`/browser-reset` wipes it).
 
 ### Configuration
 
 ```jsonc
 // ~/.pi/agent/settings.json
-{ "myChrome": { "headless": true, "profileDir": "…", "locale": "en-US", "timezone": "Europe/Zurich" } }
+{ "shadowBrowser": { "headless": true, "profileDir": "…", "locale": "en-US", "timezone": "Asia/Kolkata" } }
 ```
 
-Precedence: tool args > Pi settings `myChrome` > env (`PI_MY_CHROME_DIR`,
-`PI_MY_CHROME_REAL`, `AGENTSEARCH_HEADLESS`, `PI_MY_CHROME_LOCALE/TIMEZONE/PROXY`) > `.env` (auto-loaded) >
-defaults. Your real profile is a **read-only source** — never launched on
-(SingletonLock), only login files copied from it.
+Precedence: tool args > `shadowBrowser` settings > defaults. One daemon serves
+the one shared browser every agent (and you) drives together;
+`/browser-shutdown` stops it, `/browser-reset` wipes everything. Prefer a
+dedicated agent account over your primary logins for high-value sites.
 
 ## Limits
 
@@ -116,14 +125,14 @@ never observed or typed — secrets must not enter model context. Still out:
 closed shadow roots (unreadable from page JS, for everyone), drag-and-drop,
 hover sequences, wait-for-condition, permissions/mobile emulation. Behavioral walls
 and human-body proofs stay adversarial. Automated browsing may violate some sites'
-ToS — use your own profile at your own risk, and prefer a dedicated agent
-Chrome profile for high-value accounts.
+ToS — browse at your own risk, and prefer a dedicated agent account (not
+your primary logins) for high-value sites.
 
 ## Acknowledgements
 
 * [browser-use/jev-ultrafast](https://github.com/browser-use/jev-ultrafast) (MIT) — `snapshot.js` (vendored at `1231850a`), freshness-guard design.
 * [browser-use/browser-use](https://github.com/browser-use/browser-use) (MIT) — ported mechanics: shadow traversal, markdown extraction, combobox settle, upload/find/wait/tab/pdf/download actions.
-* [CloakHQ/CloakBrowser](https://github.com/CloakHQ/CloakBrowser) — stealth Chromium.
+* [Kaliiiiiiiiii-Vinyzu/patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright) (Apache-2.0) — stealth Playwright fork driving the agent browser.
 
 ## Contributing
 
